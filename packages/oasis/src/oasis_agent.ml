@@ -7,7 +7,10 @@ module Json = Std.Data.Json
     Codex) as subprocesses and expose their output as chat streams.
     Agent subprocesses live on blocking lanes. They run until they exit or
     are cancelled; a watchdog kills them only when [timeout_s] > 0 (set by
-    config or by the caller). *)
+    config or by the caller). Grok's [--single] turn also stays up after it
+    has finished (it keeps a login refresh running), so a finished turn or
+    ten minutes without any output closes that run with the text it already
+    wrote. *)
 
 type agent = {
   name: string;
@@ -181,9 +184,46 @@ let resolve_workdir = fun (a : agent) (requested : string option) ->
             |> List.filter ~fn:(fun r -> not (String.is_empty r))
             |> List.filter_map ~fn:(fun r -> normalize_abs_path r |> Result.to_option)
           in
-          if List.any roots ~fn:(fun root -> path_within ~root path) then Ok path
+          (* No directory of its own and no allow-list: the caller may point
+             this agent at any absolute path. An allow-list, or a configured
+             workdir, still confines the request. *)
+          if List.is_empty roots && String.is_empty a.workdir then Ok path
+          else if List.any roots ~fn:(fun root -> path_within ~root path) then Ok path
           else Error ("workdir not allowed for agent " ^ a.name ^ ": " ^ path)
     )
+
+let expand_user = fun path ->
+  let home = Env.var Env.String ~name:"HOME" in
+  if String.equal path "~" then Option.unwrap_or home ~default:path
+  else if String.starts_with ~prefix:"~/" path then
+    match home with
+    | Some h ->
+        let rest = String.sub path ~offset:1 ~len:(String.length path - 1) in
+        let h =
+          if String.length h > 0 && Char.equal (String.get_unchecked h ~at:(String.length h - 1)) '/' then
+            String.sub h ~offset:0 ~len:(String.length h - 1)
+          else h
+        in
+        h ^ rest
+    | None -> path
+  else path
+
+let is_dir = fun path ->
+  match Path.from_string path with
+  | Error _ -> false
+  | Ok p -> Path.is_directory p
+
+(** Resolves [raw] for [a] and keeps it only when that directory exists.
+    An empty [raw] leaves the agent unchanged. *)
+let use_workdir = fun (a : agent) raw ->
+  let raw = String.trim raw in
+  if String.is_empty raw then Ok a
+  else
+    match resolve_workdir a (Some (expand_user raw)) with
+    | Error e -> Error e
+    | Ok path when String.is_empty path -> Ok a
+    | Ok path ->
+        if is_dir path then Ok { a with workdir = path } else Error ("工作目录不存在：" ^ path)
 
 (** Variables a child agent inherits; everything else (API keys in
     particular) is dropped. *)
@@ -382,13 +422,35 @@ let explain_note = fun note ->
   else
     note
 
+(** How [drain_proc] stopped. [Turn_finished] and [Idle] mean we killed a
+    process that had already stopped producing output. *)
+type drain_stop =
+  | Process_exit
+  | Turn_finished
+  | Idle
+
+(** Ten minutes. Grok thinks and runs tools in shorter gaps; past this with
+    no stdout or stderr, the process is the leftover login refresh. *)
+let grok_idle_s = 600
+
+let idle_s_of = fun (a : agent) ->
+  match command_name a with
+  | "grok" -> grok_idle_s
+  | _ -> 0
+
 (** Poll both pipes without [Fs.File.read]. That helper waits until one fd
     is readable, so a quiet stderr stalls the loop while stdout fills and
-    the CLI blocks on its own write. Returns the stderr tail. *)
-let drain_proc = fun ~proc ~on_line () ->
+    the CLI blocks on its own write. Returns the stderr tail and why the
+    wait ended. [turn_done] is set by the caller when a line says the turn
+    is finished; the process then gets two seconds to exit on its own. *)
+let drain_proc = fun ~proc ~on_line ?(idle_s = 0) ?(turn_done = ref false) () ->
   let pending = ref "" in
   let err = ref "" in
   let raw = IO.Bytes.create ~size:4096 in
+  let last_io = ref (Time.Instant.now ()) in
+  let armed = ref None in
+  let why = ref Process_exit in
+  let reaped = ref false in
   let read_file = fun file ~on_chunk ->
     match file with
     | None -> false
@@ -397,6 +459,7 @@ let drain_proc = fun ~proc ~on_line () ->
         | Ok n when n > 0 ->
             let chunk = IO.Bytes.to_string raw |> fun s -> String.sub s ~offset:0 ~len:n in
             on_chunk chunk;
+            last_io := Time.Instant.now ();
             true
         | _ -> false
       )
@@ -416,22 +479,47 @@ let drain_proc = fun ~proc ~on_line () ->
     | Ok (Some (Process.Exited _ | Process.Signaled _)) -> true
     | _ -> false
   in
+  let flush_pending () =
+    let _ = read_once () in
+    if not (String.is_empty !pending) then (
+      on_line !pending;
+      pending := ""
+    )
+  in
+  let killed_at = ref None in
+  let reap reason =
+    if not !reaped then (
+      reaped := true;
+      why := reason;
+      killed_at := Some (Time.Instant.now ());
+      kill_group proc
+    )
+  in
   let rec loop () =
     let got = read_once () in
-    if exited () then (
-      let _ = read_once () in
-      if not (String.is_empty !pending) then (
-        on_line !pending;
-        pending := ""
-      )
-    ) else if got then loop ()
+    if !turn_done && Option.is_none !armed then armed := Some (Time.Instant.now ());
+    if exited () then flush_pending ()
     else (
-      Kernel.Thread.sleep_ns (Time.Duration.to_nanos (Time.Duration.from_millis 20));
-      loop ()
+      let idle =
+        idle_s > 0 && Time.Duration.to_millis (Time.Instant.elapsed !last_io) >= idle_s * 1000
+      in
+      let grace_over =
+        match !armed with
+        | Some t -> Time.Duration.to_millis (Time.Instant.elapsed t) >= 2000
+        | None -> false
+      in
+      if grace_over then reap Turn_finished else if idle then reap Idle;
+      if exited () then flush_pending ()
+      else
+        match !killed_at with
+        | Some t when Time.Duration.to_millis (Time.Instant.elapsed t) >= 3000 -> flush_pending ()
+        | _ ->
+            if not got then Kernel.Thread.sleep_ns (Time.Duration.to_nanos (Time.Duration.from_millis 20));
+            loop ()
     )
   in
   loop ();
-  explain_note !err
+  (explain_note !err, !why)
 
 let exit_code = fun ~proc ->
   match Process.try_wait proc with
@@ -441,7 +529,7 @@ let exit_code = fun ~proc ->
 
 (** Synchronous collection; call ONLY from a blocking lane. [on_line] sees
     every raw stdout line (for step extraction by the caller). *)
-let collect = fun ?(on_line = fun (_ : string) -> ()) ?(on_spawn = fun (_ : Process.t) -> ()) ~(agent : agent) ~model ~prompt () ->
+let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn = fun (_ : Process.t) -> ()) ~(agent : agent) ~model ~prompt () ->
   let args =
     let arg_list = build_args agent ~model ~prompt in
     Array.init ~count:(List.length arg_list) ~fn:(fun i -> List.get_unchecked arg_list ~at:i)
@@ -453,29 +541,40 @@ let collect = fun ?(on_line = fun (_ : string) -> ()) ?(on_spawn = fun (_ : Proc
       watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid:(self ()) ~leg:0;
       let buf = ref "" in
       let jn = Oasis_steps.joiner () in
+      let turn_done = ref false in
       let observe = on_line in
       let on_line line =
+        if Oasis_steps.turn_finished ~command:agent.command line then turn_done := true;
         observe line;
         let text, _ = consume_line jn ~command:agent.command line in
         buf := !buf ^ text
       in
-      let note = drain_proc ~proc ~on_line () in
+      let idle_s = if idle_s < 0 then idle_s_of agent else idle_s in
+      let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
       let code = exit_code ~proc in
       let _ = Process.close proc in
       let with_note = fun msg -> if String.is_empty note then msg else msg ^ ": " ^ note in
-      (* WorkBuddy reports "not logged in" on stderr and still exits 0. *)
-      if code = 0 && not (String.is_empty (String.trim !buf)) then
-        Ok !buf
-      else if code = 0 && not (String.is_empty note) then
-        Error note
-      else if code = 0 then
-        Ok !buf
-      else if code = 137 && agent.timeout_s > 0 then
-        Error (with_note ("agent timeout (" ^ Int.to_string agent.timeout_s ^ "s)"))
-      else if code = 137 then
-        Error (with_note "agent killed (SIGKILL)")
+      let closed_with_answer =
+        match why with
+        | Turn_finished -> true
+        | Idle -> not (String.is_empty (String.trim !buf))
+        | Process_exit -> false
+      in
+      (* A finished grok turn often leaves the process up. The text it
+         already wrote is the answer, not a failure. *)
+      if closed_with_answer then Ok !buf
       else
-        Error (with_note ("agent exited with code " ^ Int.to_string code))
+        match why with
+        | Idle -> Error (with_note ("agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"))
+        | Turn_finished | Process_exit ->
+            (* WorkBuddy reports "not logged in" on stderr and still exits 0. *)
+            if code = 0 && not (String.is_empty (String.trim !buf)) then Ok !buf
+            else if code = 0 && not (String.is_empty note) then Error note
+            else if code = 0 then Ok !buf
+            else if code = 137 && agent.timeout_s > 0 then
+              Error (with_note ("agent timeout (" ^ Int.to_string agent.timeout_s ^ "s)"))
+            else if code = 137 then Error (with_note "agent killed (SIGKILL)")
+            else Error (with_note ("agent exited with code " ^ Int.to_string code))
 
 (** Streaming run; call ONLY from a blocking lane. Lines go to [to_pid] as
     [Agent_line], the exit code as [Agent_done]. *)
@@ -491,11 +590,26 @@ let stream = fun ~(agent : agent) ~model ~prompt ~to_pid ~leg () ->
   | Ok proc ->
       send to_pid (Agent_spawned (leg, proc));
       watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid ~leg;
+      let turn_done = ref false in
+      let saw_text = ref false in
       let on_line line =
+        if Oasis_steps.turn_finished ~command:agent.command line then turn_done := true;
+        (match extract_text ~command:agent.command line with Some _ -> saw_text := true | None -> ());
         send to_pid (Agent_line (leg, line))
       in
-      let note = drain_proc ~proc ~on_line () in
-      let code = exit_code ~proc in
+      let idle_s = idle_s_of agent in
+      let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
+      let code =
+        match why with
+        | Turn_finished -> 0
+        | Idle when !saw_text -> 0
+        | Idle | Process_exit -> exit_code ~proc
+      in
+      let note =
+        match why with
+        | Idle when not !saw_text -> "agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"
+        | _ -> note
+      in
       let _ = Process.close proc in
       send to_pid (Agent_done (leg, code, note));
       Ok ()

@@ -372,6 +372,30 @@ let basename = fun command ->
   | Some b -> b
   | None -> command
 
+(** Grok prints the answer and then does not exit: [--single] keeps a login
+    refresh alive. [type = end] is the documented last event; current builds
+    also log an ACP [turn_completed] update. Either one means the turn is
+    over even though the process is still running. *)
+let turn_finished = fun ~command (line : string) ->
+  match basename command with
+  | "grok" -> (
+      let trimmed = String.trim line in
+      if not (String.starts_with trimmed ~prefix:"{") then false
+      else
+        match Json.from_string trimmed with
+        | Ok (Json.Object _ as j) -> (
+            match str j "type" with
+            | Some "end" -> true
+            | _ -> (
+                match Json.get_field "params" j |> Option.and_then ~fn:(fun p -> Json.get_field "update" p) with
+                | Some u -> String.equal (str u "sessionUpdate" |> Option.unwrap_or ~default:"") "turn_completed"
+                | None -> false
+              )
+          )
+        | _ -> false
+    )
+  | _ -> false
+
 (** [parse ~command line] = [Some steps] for a json event line of a known
     agent CLI ([[]] for bookkeeping events), [None] for a plain-text line. *)
 let parse = fun ~command (line : string) ->

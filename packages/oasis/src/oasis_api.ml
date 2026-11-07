@@ -241,19 +241,45 @@ let handle_get_thread = fun (state : state) (ctx : Trail.ctx) ->
   | Some th -> Trail.json ctx (Oasis_thread.to_json th)
   | None -> Trail.json ~status:Net.Http.Status.NotFound ctx (Json.obj [ ("error", Json.string "没有这个对话") ])
 
+(** A directory the user pointed an agent at, recorded on the conversation
+    or on the task. The sandbox directory under the workspace root is not
+    one of these. *)
+let recorded_workdir = fun (state : state) ~id ->
+  let config = Sync.Atomic.get state.config in
+  let sandbox = Oasis_workspace.dir_of config ~id in
+  let explicit d = if String.is_empty d || String.equal d sandbox then None else Some d in
+  match Oasis_thread.get state.threads id with
+  | Some th -> (
+      match explicit th.Oasis_thread.workdir with
+      | Some d -> Some d
+      | None -> None)
+  | None ->
+      List.find (ConcurrentHashMap.values state.feed) ~fn:(fun t ->
+        String.equal t.Oasis_feed.workspace id && Option.is_some (explicit t.Oasis_feed.workdir))
+      |> Option.and_then ~fn:(fun t -> explicit t.Oasis_feed.workdir)
+
 (** GET /api/workspace?id=: the files a task's agents produced. *)
 let handle_workspace = fun (state : state) (ctx : Trail.ctx) ->
   let config = Sync.Atomic.get state.config in
   match query_param ctx "id" with
-  | Some id when Oasis_workspace.exists config ~id -> Trail.json ctx (Oasis_workspace.listing_json config ~id)
-  | _ -> Trail.json ~status:Net.Http.Status.NotFound ctx (Json.obj [ ("error", Json.string "这个任务没有工作目录") ])
+  | Some id -> (
+      match recorded_workdir state ~id with
+      | Some dir when Oasis_agent.is_dir dir -> Trail.json ctx (Oasis_workspace.listing_at ~id ~dir)
+      | _ when Oasis_workspace.exists config ~id -> Trail.json ctx (Oasis_workspace.listing_json config ~id)
+      | _ -> Trail.json ~status:Net.Http.Status.NotFound ctx (Json.obj [ ("error", Json.string "这个任务没有工作目录") ]))
+  | None -> Trail.json ~status:Net.Http.Status.NotFound ctx (Json.obj [ ("error", Json.string "这个任务没有工作目录") ])
 
 (** GET /api/workspace/file?id=&path=: one produced file (text, capped). *)
 let handle_workspace_file = fun (state : state) (ctx : Trail.ctx) ->
   let config = Sync.Atomic.get state.config in
   match (query_param ctx "id", query_param ctx "path") with
   | (Some id, Some path) -> (
-      match Oasis_workspace.read_file config ~id ~path with
+      let read =
+        match recorded_workdir state ~id with
+        | Some dir -> Oasis_workspace.read_under ~base:dir ~id ~path
+        | None -> Oasis_workspace.read_file config ~id ~path
+      in
+      match read with
       | Ok j -> Trail.json ctx j
       | Error e -> Trail.json ~status:Net.Http.Status.NotFound ctx (Json.obj [ ("error", Json.string e) ]))
   | _ -> Trail.json ~status:Net.Http.Status.BadRequest ctx (Json.obj [ ("error", Json.string "缺少 id 或 path") ])

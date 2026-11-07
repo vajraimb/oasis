@@ -65,8 +65,7 @@ type entry = {
   modified_ms: int;
 }
 
-let list_files = fun config ~id ->
-  let base = dir_of config ~id in
+let list_under = fun ~base ->
   let out = ref [] in
   let count = ref 0 in
   let rec walk rel depth =
@@ -94,22 +93,26 @@ let list_files = fun config ~id ->
   walk "" 0;
   List.rev !out
 
+let list_files = fun config ~id -> list_under ~base:(dir_of config ~id)
+
 let entry_json = fun (e : entry) ->
   Json.obj [ ("path", Json.string e.path); ("size", Json.int e.size); ("modified_ms", Json.int e.modified_ms) ]
 
-let listing_json = fun config ~id ->
-  let files = list_files config ~id in
+let listing_at = fun ~id ~dir ->
+  let files = list_under ~base:dir in
   Json.obj
     [
       ("id", Json.string id);
-      ("dir", Json.string (dir_of config ~id));
+      ("dir", Json.string dir);
       ("files", Json.array (List.map files ~fn:entry_json));
       ("truncated", Json.bool (List.length files >= max_files));
     ]
 
+let listing_json = fun config ~id -> listing_at ~id ~dir:(dir_of config ~id)
+
 (** A file inside the workspace; relative path only, no [..], and the
     resolved target must stay inside (symlinks pointing out are refused). *)
-let read_file = fun config ~id ~path ->
+let read_under = fun ~base ~id ~path ->
   let segments = String.split ~by:"/" path in
   if
     (not (valid_id id))
@@ -118,7 +121,6 @@ let read_file = fun config ~id ~path ->
     || List.any segments ~fn:(fun s -> String.equal s ".." || String.is_empty s)
   then Error "bad path"
   else
-    let base = dir_of config ~id in
     let canon p = Path.from_string p |> Result.to_option |> Option.and_then ~fn:(fun p -> Fs.canonicalize p |> Result.to_option) |> Option.map ~fn:Path.to_string in
     match (canon base, canon (base ^ "/" ^ path)) with
     | (Some b, Some f) when String.starts_with ~prefix:(b ^ "/") f -> (
@@ -138,3 +140,5 @@ let read_file = fun config ~id ~path ->
                   ("content", Json.string shown);
                 ]))
     | _ -> Error "not found"
+
+let read_file = fun config ~id ~path -> read_under ~base:(dir_of config ~id) ~id ~path

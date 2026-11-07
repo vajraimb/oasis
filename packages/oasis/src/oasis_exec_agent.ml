@@ -210,7 +210,30 @@ let in_workspace = fun (state : state) ~request_id ?workspace (agent : Oasis_age
           { agent with Oasis_agent.workdir = dir })
   | _ -> agent
 
-let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (ctx : Trail.ctx) (body : Json.t) ~(category : string) ~(stream_requested : bool) ~(request_id : string) ->
+(** Puts [requested] on the agent and remembers it for this conversation.
+    Falls back to the task workspace when no directory was asked for. *)
+let place_agent = fun (state : state) ~request_id ?workspace ?requested (agent : Oasis_agent.agent) ->
+  match requested with
+  | None -> Ok (in_workspace state ~request_id ?workspace agent)
+  | Some raw -> (
+      match Oasis_agent.use_workdir agent raw with
+      | Error e -> Error e
+      | Ok agent ->
+          let id = match workspace with Some id -> id | None -> request_id in
+          broadcast_event
+            state
+            ~type_:"workspace"
+            ~request_id
+            ~data:
+              (Json.obj
+                [
+                  ("id", Json.string id);
+                  ("dir", Json.string agent.Oasis_agent.workdir);
+                  ("explicit", Json.bool true);
+                ]);
+          Ok agent)
+
+let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir (state : state) (ctx : Trail.ctx) (body : Json.t) ~(category : string) ~(stream_requested : bool) ~(request_id : string) ->
   audit_log state ~path:"/agent-path-enter" ~category ~goal:"-" ~stream_:stream_requested ~request_id ();
   let config = Sync.Atomic.get state.config in
   let model =
@@ -235,7 +258,9 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
       | Some a -> (a, Oasis_feed.last_user_text body)
       | None -> (agent, prompt0)
     in
-    (in_workspace state ~request_id ?workspace agent, prompt)
+    match place_agent state ~request_id ?workspace ?requested:workdir agent with
+    | Error e -> Error e
+    | Ok agent -> Ok (agent, prompt)
   in
   audit_log
     state
@@ -297,7 +322,16 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
                   | Some m -> m
                   | None -> List.head agent.Oasis_agent.models |> Option.unwrap_or ~default:""
                 in
-                let agent, base_prompt = prompt_for nm agent prompt0 in
+                match prompt_for nm agent prompt0 with
+                | Error e ->
+                    let _ = Oasis_signals.update state.signals nm ~fn:Oasis_signals.release_in_flight in
+                    let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed !t0) in
+                    attempts :=
+                      { Oasis_router.account = nm; model = nm; status = None; error = Some e; latency_ms; cost_nano = 0 }
+                      :: !attempts;
+                    emit_attempt_finished state ~request_id ~account:nm ~status:None ~latency_ms ~error:(Some e);
+                    start_agent ()
+                | Ok (agent, base_prompt) ->
                 let prompt =
                   if String.is_empty !sent then base_prompt
                   else
@@ -331,6 +365,16 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
         let proc = ref None in
         let finished = ref false in
         let released = ref false in
+        (* A dropped page or tunnel must not abandon the agent. Writes after
+           this are skipped; the loop stays up until the process finishes and
+           the answer is stored on the task. *)
+        let detached = ref false in
+        let write_client payload =
+          if not !detached then
+            match write_stream client_stream payload with
+            | Ok () -> ()
+            | Error _ -> detached := true
+        in
         let release_slot () =
           if not !released then (
             released := true;
@@ -379,7 +423,7 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
                   ("ok", Json.bool true);
                   ("answer", Json.string (Oasis_steps.clip !sent 60000));
                 ]);
-          let _ = write_stream client_stream "data: [DONE]\n\n" in
+          write_client "data: [DONE]\n\n";
           send (self ()) (Conductor_done (Ok ()))
         in
         let finish_fail reason =
@@ -427,18 +471,10 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
                     ("error", Json.string ("所有 agent 都失败了，最后一个：" ^ reason));
                     ("answer", Json.string !sent);
                   ]);
-            let _ = write_stream client_stream "data: [DONE]\n\n" in
+            write_client "data: [DONE]\n\n";
             send (self ()) (Conductor_done (Ok ()));
             false
           )
-        in
-        let client_gone e =
-          finished := true;
-          release_slot ();
-          emit_task_done
-            ~error:("调用方断开了连接，结果未送达（" ^ !current ^ " 仍可能在后台跑完）")
-            state ~request_id ~chosen:None ~attempts:(List.length !attempts + 1) ~ok:false;
-          send (self ()) (Conductor_done (Error e))
         in
         let _ = start_agent () in
         let rec loop () =
@@ -474,8 +510,8 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
                 let payload =
                   Json.obj [ ("error", Json.obj [ ("message", Json.string (cancel_text reason)); ("type", Json.string "oasis_cancelled") ]) ]
                 in
-                let _ = write_stream client_stream ("data: " ^ Json.to_string payload ^ "\n\n") in
-                let _ = write_stream client_stream "data: [DONE]\n\n" in
+                write_client ("data: " ^ Json.to_string payload ^ "\n\n");
+                write_client "data: [DONE]\n\n";
                 ()
             | `Line line -> (
                 watch_session ~agent:!current line;
@@ -490,30 +526,30 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
                 | "" -> loop ()
                 | text ->
                     sent := !sent ^ text;
-                    (match
-                      write_stream
-                        client_stream
-                        ("data: " ^ Json.to_string (delta_chunk_json text) ^ "\n\n")
-                    with
-                    | Error e -> client_gone e
-                    | Ok () -> loop ()
-                )
+                    write_client ("data: " ^ Json.to_string (delta_chunk_json text) ^ "\n\n");
+                    loop ()
               )
             | `Done (code, note) ->
                 finished := true;
                 let note = String.trim note in
                 let silent = String.is_empty (String.trim !sent) in
-                (* A zero exit with an empty answer and a stderr note is a
-                   failure: WorkBuddy does this when the CLI is not logged in. *)
-                if code = 0 && not (silent && not (String.is_empty note)) then
-                  finish_ok ()
+                (* A zero exit with an empty answer and a short stderr note is
+                   a failure: WorkBuddy does this when the CLI is not logged in.
+                   A long note is the agent's own progress log, not the answer. *)
+                let brief = String.length note <= 240 in
+                let tail =
+                  if String.length note <= 400 then note
+                  else String.sub note ~offset:(String.length note - 400) ~len:400
+                in
+                if code = 0 && not (silent && not (String.is_empty note)) then finish_ok ()
                 else (
-                  (if silent && not (String.is_empty note) then sent := note);
+                  if code = 0 && silent && brief then sent := note;
                   let reason =
-                    if code = 0 then note
+                    if code = 0 && brief then note
+                    else if code = 0 then "agent 结束了这一轮，但没有给出回答"
                     else
                       let base = "agent exited with code " ^ Int.to_string code in
-                      if String.is_empty note then base else base ^ ": " ^ note
+                      if String.is_empty tail then base else base ^ ": " ^ tail
                   in
                   if finish_fail reason then loop ()
                 )
@@ -526,15 +562,11 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
                   loop ()
             | exception Receive_timeout ->
                 (* heartbeat: agent may work silently for minutes (tool
-                   runs); it runs until it exits or the task is cancelled *)
-                (match
-                  write_stream
-                    client_stream
-                    "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n"
-                with
-                | Error e -> client_gone e
-                | Ok () -> loop ()
-                )
+                   runs); it runs until it exits or the task is cancelled.
+                   A failed write only detaches the page. *)
+                write_client
+                  "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+                loop ()
           )
         in
         loop ();
@@ -582,7 +614,15 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace (state : state) (
                   agent_step_observer state ~request_id ~agent:nm ~command:agent.Oasis_agent.command
                 in
                 let on_line line = watch_session ~agent:nm line; observe line in
-                let agent, prompt = prompt_for nm agent prompt0 in
+                match prompt_for nm agent prompt0 with
+                | Error e ->
+                    let _ = Oasis_signals.update state.signals nm ~fn:Oasis_signals.release_in_flight in
+                    let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed t0) in
+                    emit_attempt_finished state ~request_id ~account:nm ~status:None ~latency_ms ~error:(Some e);
+                    try_agents
+                      ({ Oasis_router.account = nm; model = nm; status = None; error = Some e; latency_ms; cost_nano = 0 } :: acc)
+                      rest
+                | Ok (agent, prompt) ->
                 let result = blocking_agent_call ~on_line ~agent ~model:model_for ~prompt in
                 let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed t0) in
                 emit_attempt_finished

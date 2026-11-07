@@ -1,0 +1,6 @@
+#!/bin/sh
+# Prints a finished grok turn, then stays up the way `grok --single` does
+# after handle_prompt.done.
+printf '%s\n' '{"type":"text","data":"hi"}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn"}'
+sleep 30

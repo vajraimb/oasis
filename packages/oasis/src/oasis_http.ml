@@ -105,7 +105,7 @@ let use_cors_with_auth = fun ctx ->
   |> Trail.put_resp_header ~name:"Access-Control-Allow-Methods" ~value:"GET, POST, OPTIONS"
   |> Trail.put_resp_header
     ~name:"Access-Control-Allow-Headers"
-    ~value:"Content-Type, Authorization, X-Oasis-Category, X-Oasis-Goal, X-Oasis-Mode, X-Oasis-Session"
+    ~value:"Content-Type, Authorization, X-Oasis-Category, X-Oasis-Goal, X-Oasis-Mode, X-Oasis-Session, X-Oasis-Workdir, X-Oasis-Agent, X-Oasis-Thread, X-Oasis-Committee"
 
 let build_trail = fun (state : state) ->
   Trail.pipeline

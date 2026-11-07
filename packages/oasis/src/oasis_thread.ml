@@ -32,6 +32,7 @@ type thread = {
   sessions: (string * string) list;  (** agent name -> CLI session id *)
   members: string list;  (** committee members of the last committee turn *)
   workspace: string;  (** workspace id once an agent ran here; "" = none yet *)
+  workdir: string;  (** explicit directory for later agent turns; "" = the workspace id *)
 }
 
 type t = (string, thread) ConcurrentHashMap.t
@@ -60,7 +61,7 @@ let ensure = fun (t : t) ~id ~title ->
     | None ->
         let now = now_ms () in
         ConcurrentHashMap.Insert
-          ({ id; title; created_ms = now; updated_ms = now; turns = []; sessions = []; members = []; workspace = "" }, ()))
+          ({ id; title; created_ms = now; updated_ms = now; turns = []; sessions = []; members = []; workspace = ""; workdir = "" }, ()))
 
 let append_turn = fun (t : t) ~id (turn : turn) ->
   let turn = { turn with answer = Oasis_steps.clip turn.answer max_answer } in
@@ -100,6 +101,8 @@ let set_session = fun (t : t) ~id ~agent ~session ->
 let set_members = fun (t : t) ~id ~members -> update t ~id ~fn:(fun th -> { th with members })
 
 let set_workspace = fun (t : t) ~id ~workspace -> update t ~id ~fn:(fun th -> { th with workspace })
+
+let set_workdir = fun (t : t) ~id ~workdir -> update t ~id ~fn:(fun th -> { th with workdir })
 
 (** Workspace for the next agent turn. Threads whose agents already ran
     before workspaces existed keep running where their CLI sessions live. *)
@@ -166,6 +169,7 @@ let to_json = fun (th : thread) ->
       ("sessions", Json.obj (List.map th.sessions ~fn:(fun (a, s) -> (a, Json.string s))));
       ("members", Json.array (List.map th.members ~fn:Json.string));
       ("workspace", Json.string th.workspace);
+      ("workdir", Json.string th.workdir);
     ]
 
 let summary_json = fun (th : thread) ->
@@ -220,6 +224,7 @@ let of_json = fun (j : Json.t) ->
           Json.get_field "members" j |> Option.and_then ~fn:Json.get_array |> Option.unwrap_or ~default:[]
           |> List.filter_map ~fn:Json.get_string;
         workspace = s j "workspace";
+        workdir = s j "workdir";
       }
 
 let save = fun (t : t) ~path ->

@@ -48,6 +48,8 @@ button,select,textarea,input{font:inherit;color:inherit}
 .seg button:last-child{border-right:0}
 .seg button.on{background:var(--line);color:var(--text)}
 select{background:var(--bg);border:1px solid var(--line2);border-radius:6px;padding:6px 8px;outline:none}
+#workdir{background:var(--bg);border:1px solid var(--line2);border-radius:6px;padding:6px 8px;outline:none;min-width:180px;max-width:280px;font-family:var(--mono);font-size:12px}
+#workdir:focus{border-color:var(--accent)}
 .run{background:var(--accent);border:0;color:#fff;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer;white-space:nowrap}
 .run:hover{background:var(--accent2)}
 .run:disabled{opacity:.5;cursor:default}
@@ -276,14 +278,15 @@ body.resizing{cursor:col-resize;user-select:none}
   #view-work .cmd:focus-within{border-top-color:var(--accent)}
   #view-work:has(#followbar.on) .cmd{display:none}
   #view-work .cmd textarea{order:2;flex:1;width:auto;min-width:0;height:34px;min-height:34px;max-height:34px;margin:0;padding:6px 12px;border:1px solid var(--line2);border-radius:17px;background:var(--bg);resize:none;overflow-x:hidden;overflow-y:auto;line-height:22px}
-  .cmd textarea,.follow textarea,select,.diag input{font-size:16px}
+  .cmd textarea,.follow textarea,select,.diag input,#workdir{font-size:16px}
   .run kbd,.follow kbd{display:none}
   .opts{display:contents}
   #cmd-more{order:1}
   #cmd-sum{order:3;max-width:72px}
   #run{order:4}
-  #category,#goal,#picker > *,.opts .seg{display:none}
-  .cmd.more #category,.cmd.more #goal,.cmd.more #picker > *{display:block;order:0;flex:1 0 100%;width:100%;min-height:40px}
+  #category,#goal,#picker > *,.opts .seg,#workdir{display:none}
+  .cmd.more #category,.cmd.more #goal,.cmd.more #picker > *,.cmd.more #workdir{display:block;order:0;flex:1 0 100%;width:100%;min-width:0;min-height:40px}
+  .cmd.more #workdir{max-width:none}
   .cmd.more .seg{display:flex;order:0;flex:1 0 100%}
   .cmd.more .seg button{flex:1;padding:8px 0}
   .cmd.more #picker > .msel > button{width:100%;text-align:left}
@@ -308,6 +311,8 @@ body.resizing{cursor:col-resize;user-select:none}
   .follow .run{position:static}
   #detail .scroll{padding-bottom:42px}
   #pdf-btn{min-height:36px;padding:6px 14px;font-size:14px}
+  .tab[data-view="diag"]{display:none}
+  .routecard,.ev.route{display:none}
   .res td.n{max-width:none}
   .diag{padding:12px}
   .grid{grid-template-columns:1fr}
@@ -332,7 +337,7 @@ body.resizing{cursor:col-resize;user-select:none}
     <span class="desk-stat" id="h-alerts"></span>
     <span id="h-ws"><span class="dot"></span>连接中</span>
     <button class="railbtn" id="setup-open" title="账户与 agent 配置 / Accounts and agents">设置</button>
-    <button class="railbtn phone-only" id="new-task" type="button">新任务</button>
+    <button class="railbtn" id="new-task" type="button" title="开始另一个任务。正在跑的任务不会停">新任务</button>
     <button class="railbtn" id="list-toggle" title="显示 / 隐藏任务栏（快捷键 [）">任务栏</button>
     <button class="railbtn" id="rail-toggle" title="显示 / 隐藏右栏（快捷键 \）">侧栏</button>
   </div>
@@ -364,6 +369,7 @@ body.resizing{cursor:col-resize;user-select:none}
         <option value="best">质量优先</option>
         <option value="cheapest">最省钱</option>
       </select>
+      <input id="workdir" type="text" placeholder="Agent 工作目录（可选）" title="绝对路径，例如 /Users/vajra/proj 或 ~/proj。留空则每个任务用自己的目录。问答和委员会不会用到它。" spellcheck="false" autocomplete="off">
       <button class="plus phone-only" id="cmd-more" type="button" aria-label="选项" aria-expanded="false">+</button>
       <button class="sum phone-only" id="cmd-sum" type="button">自动</button>
       <button class="run" id="run" aria-label="运行">运行<kbd style="color:#dbe4ff;border-color:rgba(255,255,255,.3)">⌘↵</kbd></button>
@@ -468,6 +474,7 @@ function copy(text) { navigator.clipboard.writeText(text).then(() => toast('已�
 /* ---------- views ---------- */
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === b));
+  if (b.dataset.view === 'diag' && matchMedia('(max-width: 760px)').matches) return;
   const diag = b.dataset.view === 'diag';
   $('view-work').style.display = diag ? 'none' : 'flex';
   $('view-diag').classList.toggle('on', diag);
@@ -510,6 +517,8 @@ function syncSum() {
   else if (cat.value && opt) bits.push(opt.textContent);
   const g = $('goal');
   if (g.value !== 'balanced' && g.selectedOptions[0]) bits.push(g.selectedOptions[0].textContent);
+  const wd = ($('workdir').value || '').trim().replace(/\/+$/, '');
+  if (wd) bits.push(wd.split('/').pop() || wd);
   el.textContent = bits.join(' · ');
 }
 function setMore(on) {
@@ -577,6 +586,11 @@ function renderPicker() {
 }
 $('category').onchange = renderPicker;
 $('goal').onchange = syncSum;
+const wdEl = $('workdir');
+wdEl.value = localStorage.getItem('oasis_workdir') || '';
+wdEl.addEventListener('change', () => { localStorage.setItem('oasis_workdir', wdEl.value.trim()); syncSum(); });
+wdEl.addEventListener('input', syncSum);
+syncSum();
 $('cmd-more').onclick = e => { e.stopPropagation(); setMore(!$('cmd').classList.contains('more')); };
 $('cmd-sum').onclick = () => setMore(true);
 document.addEventListener('click', e => {
@@ -634,6 +648,8 @@ async function send(text, extra, stream) {
     'X-Oasis-Source': 'dashboard',
     'X-Oasis-Client-Ref': ref
   }, extra);
+  const wd = ($('workdir').value || '').trim();
+  if (wd) { headers['X-Oasis-Workdir'] = wd; localStorage.setItem('oasis_workdir', wd); }
   try {
     const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify({ model: null, messages: [{ role: 'user', content: text }], stream }) });
     if (!res.ok || !res.body) {
@@ -663,7 +679,10 @@ async function send(text, extra, stream) {
         } catch (e) {}
       }
     }
-  } catch (e) { toast('连接中断：' + e.message); }
+  } catch (e) {
+    if (S.sel && S.refs[S.sel] === ref) toast('页面连接断了，任务还在后台继续');
+    else toast('连接中断：' + e.message);
+  }
   S.dirtyList = true;
   if (S.sel && S.refs[S.sel] === ref) S.dirtyDetail = true;
 }
@@ -772,13 +791,17 @@ async function openFile(path) {
   renderDetail(false);
 }
 function fmtSize(n) { return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
+function pdfBar() {
+  return S.pdfText ? '<div class="ansbar"><button class="sbtn" id="pdf-btn" type="button">生成 PDF</button></div>' : '';
+}
 function renderFiles() {
+  const pdf = isPhone() ? pdfBar() : '';
   const w = S.ws;
-  if (!w || w.loading) return '<div class="empty">加载产出…</div>';
-  if (w.missing) return '<div class="empty">这个任务还没有工作目录</div>';
+  if (!w || w.loading) return pdf + (w ? '<div class="empty">加载产出…</div>' : '');
+  if (w.missing) return pdf + '<div class="empty">这个任务还没有工作目录</div>';
   const head = '<div class="dir"><span>工作目录</span><span class="mono" title="' + esc(w.dir) + '">' + esc(w.dir) + '</span>' +
     '<span class="more" id="ws-copy" style="margin-left:auto">复制路径</span><span class="more" id="ws-reload">刷新</span></div>';
-  if (!w.files.length) return '<div class="files">' + head + '<div class="empty">agent 还没在这个目录里写文件</div></div>';
+  if (!w.files.length) return pdf + '<div class="files">' + head + '<div class="empty">agent 还没在这个目录里写文件</div></div>';
   const f = S.wsFile;
   const list = w.files.map(x => '<div class="f' + (f && f.path === x.path ? ' on' : '') + '" data-p="' + esc(x.path) + '"><span class="p">' + esc(x.path) + '</span><span class="z">' + fmtSize(x.size) + '</span><span class="z">' + ago(x.modified_ms) + '</span></div>').join('');
   let view = '';
@@ -788,7 +811,7 @@ function renderFiles() {
       '<pre>' + esc(f.content) + '</pre>' + (f.truncated ? '<div class="dim" style="margin-top:6px">只显示前 512 KB（共 ' + fmtSize(f.size) + '）</div>' : '');
     view = '<div class="fview"><div class="h"><b class="mono" style="color:var(--text)">' + esc(f.path) + '</b><span class="more" id="ws-close" style="margin-left:auto">关闭</span></div>' + body + '</div>';
   }
-  return '<div class="files">' + head + list + (w.truncated ? '<div class="dim" style="padding:8px 20px">只列出前 500 个文件</div>' : '') + '</div>' + view;
+  return pdf + '<div class="files">' + head + list + (w.truncated ? '<div class="dim" style="padding:8px 20px">只列出前 500 个文件</div>' : '') + '</div>' + view;
 }
 async function loadThread() {
   if (!S.selThread) { S.thread = null; return; }
@@ -925,13 +948,18 @@ function renderDetail(scrollEnd) {
     if (!S.selThread) return;
     const th = S.thread;
     const saved = th && th.turns ? th.turns.map(x => x.answer || '').filter(Boolean).join('\n\n') : '';
-    if (saved) { S.pdfTitle = th.title || 'Oasis'; S.pdfText = saved; }
+    S.pdfTitle = (th && th.title) || 'Oasis';
+    S.pdfText = saved;
+    if (!isPhone() || !saved) S.detailTab = S.detailTab === 'files' ? 'conv' : S.detailTab;
+    const onFiles = isPhone() && S.detailTab === 'files' && !!saved;
     box.innerHTML = '<div class="dhead"><div class="dtitle">' + esc(th ? th.title : '加载…') + '</div><div class="chips"><span>历史对话（网关重启前的记录，执行过程未保存）</span>' +
       (th ? '<span><b>' + th.turns.length + '</b> 轮</span>' : '') + '<span class="mono dim">' + esc(S.selThread) + '</span>' +
       '<button class="delbtn" id="del-btn" title="删除这个对话；可选是否同时删除产出文件">删除</button></div></div>' +
-      '<div class="scroll">' + (saved ? '<div class="ansbar"><button class="sbtn" id="pdf-btn" type="button">生成 PDF</button></div>' : '') + renderConversation(null) + '</div>';
+      (isPhone() && saved ? '<div class="dtabs"><button class="dtab' + (onFiles ? '' : ' on') + '" data-t="conv">对话</button><button class="dtab' + (onFiles ? ' on' : '') + '" data-t="files">产出</button></div>' : '') +
+      '<div class="scroll">' + (onFiles ? pdfBar() : (saved && !isPhone() ? pdfBar() : '') + renderConversation(null)) + '</div>';
     $('del-btn').onclick = deleteSel;
     if ($('pdf-btn')) $('pdf-btn').onclick = downloadPdf;
+    box.querySelectorAll('.dtab').forEach(b => b.onclick = () => { S.detailTab = b.dataset.t; renderDetail(false); });
     const sc0 = box.querySelector('.scroll'); if (sc0 && scrollEnd) sc0.scrollTop = sc0.scrollHeight;
     return;
   }
@@ -943,11 +971,13 @@ function renderDetail(scrollEnd) {
   const nTurns = Math.max(tts.length, S.thread ? S.thread.turns.length : 0);
   if (S.detailTab === 'conv' && nTurns < 2) S.detailTab = 'trace';
   const ws = wsId();
-  if (S.detailTab === 'files' && !ws) S.detailTab = 'trace';
-  if (ws && (!S.ws || S.ws.id !== ws)) { S.ws = { id: ws, loading: true }; setTimeout(() => loadWorkspace(ws), 0); }
-  const turnsHtml = tts.length > 1 ? '<div class="turns">轮次' + tts.map(t => '<button class="' + (t.id === d.id ? 'on ' : '') + t.status + '" title="' + esc(t.title) + '" onclick="selectTurn(\'' + esc(t.id) + '\')">' + (t.turn || '?') + '</button>').join('') + '</div>' : '';
   const ref = S.refs[d.id];
   const answer = (ref && S.localAnswers[ref]) || d.answer || '';
+  S.pdfTitle = d.title || d.prompt || 'Oasis';
+  S.pdfText = answer;
+  if (S.detailTab === 'files' && !ws && !(isPhone() && answer)) S.detailTab = 'trace';
+  if (ws && (!S.ws || S.ws.id !== ws)) { S.ws = { id: ws, loading: true }; setTimeout(() => loadWorkspace(ws), 0); }
+  const turnsHtml = tts.length > 1 ? '<div class="turns">轮次' + tts.map(t => '<button class="' + (t.id === d.id ? 'on ' : '') + t.status + '" title="' + esc(t.title) + '" onclick="selectTurn(\'' + esc(t.id) + '\')">' + (t.turn || '?') + '</button>').join('') + '</div>' : '';
   const nSteps = (d.timeline || []).filter(e => e.kind === 'step' && (e.step === 'tool')).length;
   box.innerHTML =
     '<div class="dhead">' +
@@ -969,13 +999,13 @@ function renderDetail(scrollEnd) {
           '<button class="' + (d.user_rating < 0 ? 'on' : '') + '" onclick="rate(\'' + esc(d.id) + '\',' + (d.user_rating < 0 ? 0 : -1) + ')">👎</button></span>' : '') +
         '</div>' +
       turnsHtml +
-      (d.route_summary ? '<div class="route' + (S.routeFold ? ' fold' : '') + '"><span class="k tog" id="route-tog" title="' + (S.routeFold ? '展开' : '收起') + '路由说明（g）">' + (S.routeFold ? '▸' : '▾') + ' 路由</span><div class="rs" style="min-width:0">' + esc(d.route_summary) + scoreTable(d.route) + '</div></div>' : '') +
+      (d.route_summary ? '<div class="route routecard' + (S.routeFold ? ' fold' : '') + '"><span class="k tog" id="route-tog" title="' + (S.routeFold ? '展开' : '收起') + '路由说明（g）">' + (S.routeFold ? '▸' : '▾') + ' 路由</span><div class="rs" style="min-width:0">' + esc(d.route_summary) + scoreTable(d.route) + '</div></div>' : '') +
       (d.status === 'failed' && d.error ? '<div class="route" style="border-color:rgba(248,81,73,.4)"><span class="k" style="color:var(--err)">失败</span><div>' + esc(d.error) + '</div></div>' : '') +
     '</div>' +
     '<div class="dtabs"><button class="dtab' + (S.detailTab === 'trace' ? ' on' : '') + '" data-t="trace">执行过程</button>' +
       '<button class="dtab' + (S.detailTab === 'answer' ? ' on' : '') + '" data-t="answer">输出</button>' +
       (nTurns > 1 ? '<button class="dtab' + (S.detailTab === 'conv' ? ' on' : '') + '" data-t="conv">对话 · ' + nTurns + ' 轮</button>' : '') +
-      (ws ? '<button class="dtab' + (S.detailTab === 'files' ? ' on' : '') + '" data-t="files">产出' + (S.ws && S.ws.id === ws && S.ws.files ? ' · ' + S.ws.files.length : '') + '</button>' : '') + '</div>' +
+      (ws || (isPhone() && answer) ? '<button class="dtab' + (S.detailTab === 'files' ? ' on' : '') + '" data-t="files">产出' + (S.ws && S.ws.id === ws && S.ws.files ? ' · ' + S.ws.files.length : '') + '</button>' : '') + '</div>' +
     '<div class="scroll">' + (S.detailTab === 'trace' ? renderTimeline(d) : S.detailTab === 'conv' ? renderConversation(d) : S.detailTab === 'files' ? renderFiles() : renderAnswer(answer, d)) + '</div>';
   if ($('route-tog')) $('route-tog').onclick = toggleRoute;
   if ($('del-btn')) $('del-btn').onclick = deleteSel;
@@ -1012,9 +1042,7 @@ function renderAnswer(answer, d) {
     return '<div class="empty">' + (d.status === 'running' ? '等待输出…' :
       '没有输出') + '</div>';
   }
-  S.pdfTitle = d.title || d.prompt || 'Oasis';
-  S.pdfText = answer;
-  return '<div class="ansbar"><button class="sbtn" id="pdf-btn" type="button">生成 PDF</button></div><div class="answer">' + mdHtml(answer) + '</div>';
+  return (isPhone() ? '' : pdfBar()) + '<div class="answer">' + mdHtml(answer) + '</div>';
 }
 function pdfName(title) {
   const base = String(title || 'oasis').replace(/[\\/:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60) || 'oasis';
@@ -1348,6 +1376,7 @@ function pinBottom() {
 }
 function phoneHome() {
   if (!isPhone()) return;
+  if ($('view-diag').classList.contains('on')) document.querySelector('.tab[data-view="work"]').click();
   $('work').classList.add('list-off', 'rail-off');
   $('list-toggle').classList.remove('on');
   $('rail-toggle').classList.remove('on');

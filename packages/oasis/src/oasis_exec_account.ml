@@ -389,8 +389,18 @@ let handle_chat = fun (state : state) (ctx : Trail.ctx) ->
         | Some th when String.equal last_mode "committee" -> th.Oasis_thread.members
         | _ -> [])
   in
+  let requested_workdir =
+    let clean s =
+      let s = String.trim s in
+      if String.is_empty s then None else Some s
+    in
+    match get_header ctx "x-oasis-workdir" |> Option.and_then ~fn:clean with
+    | Some _ as w -> w
+    | None -> (match prior with Some th -> clean th.Oasis_thread.workdir | None -> None)
+  in
   if not (List.is_empty committee) then
     Oasis_committee.handle state ctx body ~members:committee ~category ~goal ~request_id ~workspace:thread_id
+      ~workdir:requested_workdir
   else
   let mode =
     match get_header ctx "x-oasis-mode" with
@@ -418,7 +428,8 @@ let handle_chat = fun (state : state) (ctx : Trail.ctx) ->
   if use_agent then
     handle_chat_agent ?pinned:pinned_agent
       ?prefer:(if String.equal last_mode "agent" && not (String.is_empty last_executor) then Some last_executor else None)
-      ?thread:prior ?workspace:(Oasis_thread.workspace_for prior ~id:thread_id) state ctx body ~category ~stream_requested ~request_id
+      ?thread:prior ?workspace:(Oasis_thread.workspace_for prior ~id:thread_id) ?workdir:requested_workdir
+      state ctx body ~category ~stream_requested ~request_id
   else
   let decision =
     Oasis_router.route_scored

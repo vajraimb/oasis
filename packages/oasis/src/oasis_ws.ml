@@ -78,10 +78,16 @@ let track_thread = fun (state : state) ~type_ ~request_id (data : Json.t) ->
       | _ -> ())
   | "workspace" -> (
       match thread_of_task () with
-      | Some t when not (String.is_empty (str "id")) ->
-          Oasis_thread.set_workspace state.threads ~id:t.Oasis_feed.thread ~workspace:(str "id");
+      | Some t ->
+          if not (String.is_empty (str "id")) then
+            Oasis_thread.set_workspace state.threads ~id:t.Oasis_feed.thread ~workspace:(str "id");
+          if
+            Json.get_field "explicit" data |> Option.and_then ~fn:Json.get_bool |> Option.unwrap_or ~default:false
+            && not (String.is_empty (str "dir"))
+          then
+            Oasis_thread.set_workdir state.threads ~id:t.Oasis_feed.thread ~workdir:(str "dir");
           save ()
-      | _ -> ())
+      | None -> ())
   | "committee_started" -> (
       match thread_of_task () with
       | Some t ->

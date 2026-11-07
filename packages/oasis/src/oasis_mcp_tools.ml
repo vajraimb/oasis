@@ -258,10 +258,15 @@ let mcp_tool_agent = fun (state : state) (params : Json.t) ->
       let timeout_override = mcp_get_int params "timeout_s" in
       let requested_workdir = mcp_get_str params "workdir" in
       let with_overrides ~request_id (agent : Oasis_agent.agent) =
-        match Oasis_agent.resolve_workdir agent requested_workdir with
+        let prepared =
+          match requested_workdir with
+          | None -> Ok agent
+          | Some raw -> Oasis_agent.use_workdir agent raw
+        in
+        match prepared with
         | Error e -> Error e
-        | Ok workdir ->
-            let agent = in_workspace state ~request_id ~workspace:request_id { agent with Oasis_agent.workdir } in
+        | Ok agent ->
+            let agent = in_workspace state ~request_id ~workspace:request_id agent in
             Ok
               (match timeout_override with
                | Some t -> { agent with Oasis_agent.timeout_s = t }

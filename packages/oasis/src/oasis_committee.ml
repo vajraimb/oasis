@@ -183,17 +183,20 @@ let call_account = fun (state : state) (config : Oasis_config.t) ~(name : string
           Error err
     )
 
-(** One headless agent run. An agent with no workdir of its own gets a
-    private directory under the conversation, so parallel members do not
-    share a tree and nothing is written into the gateway's directory. *)
-let call_agent = fun (state : state) (config : Oasis_config.t) ~workspace ~body (agent : Oasis_agent.agent) ->
+(** One headless agent run. With [shared], every member works in the
+    directory the user named. Otherwise an agent with no workdir of its own
+    gets a private directory under the conversation, so parallel members do
+    not share a tree and nothing is written into the gateway's directory. *)
+let call_agent = fun (state : state) (config : Oasis_config.t) ~workspace ?shared ~body (agent : Oasis_agent.agent) ->
   let placed =
-    if not (String.is_empty agent.Oasis_agent.workdir) then Ok agent
-    else
-      let id = workspace ^ "-" ^ agent.Oasis_agent.name in
-      match Oasis_workspace.prepare config ~id with
-      | Ok dir -> Ok { agent with Oasis_agent.workdir = dir }
-      | Error e -> Error e
+    match shared with
+    | Some dir -> Oasis_agent.use_workdir agent dir
+    | None when not (String.is_empty agent.Oasis_agent.workdir) -> Ok agent
+    | None ->
+        let id = workspace ^ "-" ^ agent.Oasis_agent.name in
+        match Oasis_workspace.prepare config ~id with
+        | Ok dir -> Ok { agent with Oasis_agent.workdir = dir }
+        | Error e -> Error e
   in
   match placed with
   | Error e -> Error e
@@ -226,12 +229,12 @@ let call_agent = fun (state : state) (config : Oasis_config.t) ~workspace ~body 
             Ok (text, latency_ms)
           )
 
-let call_seat = fun (state : state) (config : Oasis_config.t) ~workspace ~body seat ->
+let call_seat = fun (state : state) (config : Oasis_config.t) ~workspace ?shared ~body seat ->
   match seat with
   | Seat_account account ->
       let messages = Json.get_field "messages" body |> Option.unwrap_or ~default:(Json.array []) in
       call_account state config ~name:account.Oasis_config.name ~messages
-  | Seat_agent agent -> call_agent state config ~workspace ~body agent
+  | Seat_agent agent -> call_agent state config ~workspace ?shared ~body agent
 
 let synthesis_prompt = fun ~(question : string) (answers : (string * string) list) ->
   "下面是 " ^ Int.to_string (List.length answers) ^ " 位 AI 对同一个问题的回答。请你作为主持人写一份汇总：先给出综合结论，"
@@ -261,7 +264,7 @@ let completion_json = fun ~request_id ~(content : string) (extra : (string * Jso
     @ extra)
 
 let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : string list) ~(category : string)
-    ~(goal : Oasis_router.goal) ~(request_id : string) ~(workspace : string) ->
+    ~(goal : Oasis_router.goal) ~(request_id : string) ~(workspace : string) ~(workdir : string option) ->
   let config = Sync.Atomic.get state.config in
   let reject msg =
     emit_task_done ~error:msg state ~request_id ~chosen:None ~attempts:0 ~ok:false;
@@ -281,9 +284,29 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
   if n < min_members || n > max_members then reject "委员会需要 2–3 个不同的成员"
   else if not (List.is_empty unusable) then reject ("这些成员不存在或已停用：" ^ String.concat "、" unusable)
   else if List.length seats < min_members then reject "委员会需要 2–3 个不同的成员"
-  else (
+  else
+    let shared =
+      match workdir with
+      | None -> Ok None
+      | Some raw -> (
+          match List.find config.Oasis_config.agents ~fn:(fun a -> a.Oasis_agent.enabled) with
+          | None -> Ok None
+          | Some probe -> (
+              match Oasis_agent.use_workdir probe raw with
+              | Error e -> Error e
+              | Ok a when String.is_empty a.Oasis_agent.workdir -> Ok None
+              | Ok a -> Ok (Some a.Oasis_agent.workdir)))
+    in
+    match shared with
+    | Error e -> reject e
+    | Ok shared -> (
     let n = List.length seats in
     let tokens = List.map seats ~fn:(fun (token, _) -> token) in
+    (match shared with
+     | Some dir ->
+         broadcast_event state ~type_:"workspace" ~request_id
+           ~data:(Json.obj [ ("id", Json.string workspace); ("dir", Json.string dir); ("explicit", Json.bool true) ])
+     | None -> ());
     broadcast_event state ~type_:"committee_started" ~request_id
       ~data:(Json.obj [ ("members", Json.array (List.map tokens ~fn:Json.string)) ]);
     let parent = self () in
@@ -291,7 +314,7 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
     List.enumerate seats
     |> List.for_each ~fn:(fun (i, (_, seat)) ->
       emit_attempt_started state ~request_id ~account:(seat_label seat);
-      let pid = spawn (fun () -> send parent (Committee_answer (i, call_seat state config ~workspace ~body seat)); Ok ()) in
+      let pid = spawn (fun () -> send parent (Committee_answer (i, call_seat state config ~workspace ?shared ~body seat)); Ok ()) in
       kids := pid :: !kids;
       ());
     let selector msg =

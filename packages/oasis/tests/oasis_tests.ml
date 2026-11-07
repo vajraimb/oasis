@@ -1738,6 +1738,12 @@ let test_steps_parse_agents = fun _ctx ->
   let s = steps_of ~command:"grok" "{\"type\":\"tool_call_update\",\"toolCallId\":\"x1\",\"status\":\"completed\",\"rawOutput\":{\"output_for_prompt\":\"exit: 0\\n/tmp\\n\",\"exit_code\":0}}" in
   Test.assert_equal ~expected:(Some true) ~actual:(Json.get_field "ok" (List.get_unchecked s ~at:0) |> Option.and_then ~fn:Json.get_bool);
   Test.assert_equal ~expected:[] ~actual:(kinds (steps_of ~command:"grok" "{\"type\":\"tool_call_update\",\"toolCallId\":\"x1\",\"status\":\"in_progress\"}"));
+  Test.assert_equal ~expected:true ~actual:(Steps.turn_finished ~command:"grok" "{\"type\":\"end\",\"stopReason\":\"end_turn\"}");
+  Test.assert_equal ~expected:false ~actual:(Steps.turn_finished ~command:"grok" "{\"type\":\"text\",\"data\":\"hi\"}");
+  Test.assert_equal
+    ~expected:true
+    ~actual:(Steps.turn_finished ~command:"/usr/bin/grok" "{\"method\":\"_x.ai/session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"turn_completed\"}}}");
+  Test.assert_equal ~expected:false ~actual:(Steps.turn_finished ~command:"claude" "{\"type\":\"end\"}");
   (* non-json output of a known CLI and unknown CLIs stay plain text *)
   Test.assert_equal ~expected:true ~actual:(Option.is_none (Steps.parse ~command:"gemini" "Loaded cached credentials."));
   Test.assert_equal ~expected:true ~actual:(Option.is_none (Steps.parse ~command:"opencode" "{\"type\":\"text\"}"));
@@ -3380,6 +3386,48 @@ let test_gateway_committee_includes_agent = fun _ctx ->
                   Test.assert_equal ~expected:400 ~actual:status2;
                   Ok ())))
 
+(** A committee that is pointed at a directory works there, not in an empty
+    per-member sandbox. A missing directory fails before anyone starts. *)
+let test_committee_uses_requested_workdir = fun _ctx ->
+  match start_mocks 1 with
+  | Error e -> Error e
+  | Ok mocks -> (
+      let m = List.get_unchecked mocks ~at:0 in
+      Mock.set_scenario m { (Mock.default_scenario) with body = openai_ok_body ~content:"from-api" };
+      let account =
+        { (mk_account ~models:[ "m-x" ] "acc_api") with Config.base_url = "http://127.0.0.1:" ^ Int.to_string m.pool.port }
+      in
+      let cwd = Env.current_dir () |> Result.unwrap |> Path.to_string in
+      let config =
+        mk_config_agents
+          ~accounts:[ account ]
+          ~agents:[ mk_agent ~command:"/bin/pwd" ~args:[] "agent_b" ]
+          ~kb:[ mk_kb_model "m-x" ]
+          ~routes:[]
+          ~max_fallback:1
+      in
+      match Gateway.start ~config_path:None ~config ~port:0 () with
+      | Error e -> Error ("gateway: " ^ e)
+      | Ok gw -> (
+          let post extra =
+            gw_post ~port:gw.port ~path:"/v1/chat/completions"
+              ~headers:([ ("Content-Type", "application/json"); ("X-Oasis-Committee", "acc_api,agent:agent_b") ] @ extra)
+              ~body:
+                (Json.to_string
+                  (Json.obj [ ("messages", Json.array [ Json.obj [ ("role", Json.string "user"); ("content", Json.string "q") ] ]) ]))
+          in
+          match post [ ("X-Oasis-Workdir", cwd) ] with
+          | Error e -> Error e
+          | Ok (status, resp) -> (
+              Test.assert_equal ~expected:200 ~actual:status;
+              Test.assert_equal ~expected:true ~actual:(String.contains resp cwd);
+              match post [ ("X-Oasis-Workdir", "/tmp/oasis-no-such-committee-dir") ] with
+              | Error e -> Error e
+              | Ok (status2, resp2) ->
+                  Test.assert_equal ~expected:400 ~actual:status2;
+                  Test.assert_equal ~expected:true ~actual:(String.contains resp2 "工作目录不存在");
+                  Ok ())))
+
 let chat_body = fun text ->
   Json.to_string
     (Json.obj [ ("messages", Json.array [ Json.obj [ ("role", Json.string "user"); ("content", Json.string text) ] ]) ])
@@ -3801,7 +3849,7 @@ let test_thread_history_oldest_first = fun _ctx ->
     { Oasis.Thread.request_id = prompt; prompt; answer = "a-" ^ prompt; executor = "x"; mode = "chat"; status = "ok"; finished_ms = 0 }
   in
   let th : Oasis.Thread.thread =
-    { id = "t"; title = ""; created_ms = 0; updated_ms = 0; turns = [ turn "one"; turn "two" ]; sessions = []; members = []; workspace = "" }
+    { id = "t"; title = ""; created_ms = 0; updated_ms = 0; turns = [ turn "one"; turn "two" ]; sessions = []; members = []; workspace = ""; workdir = "" }
   in
   let contents =
     Oasis.Thread.history_messages th
@@ -4106,9 +4154,13 @@ let test_agent_resolve_workdir = fun _ctx ->
     ~expected:true
     ~actual:(match Agent.resolve_workdir only_default (Some "/tmp") with Error _ -> true | Ok _ -> false);
   let unconfigured = mk_agent "wd3" in
+  Test.assert_equal ~expected:(Ok "/tmp/proj") ~actual:(Agent.resolve_workdir unconfigured (Some "/tmp/proj"));
   Test.assert_equal
     ~expected:true
-    ~actual:(match Agent.resolve_workdir unconfigured (Some "/tmp") with Error _ -> true | Ok _ -> false);
+    ~actual:(match Agent.resolve_workdir unconfigured (Some "relative") with Error _ -> true | Ok _ -> false);
+  Test.assert_equal
+    ~expected:true
+    ~actual:(match Agent.resolve_workdir unconfigured (Some "/tmp/../etc") with Error _ -> true | Ok _ -> false);
   Ok ()
 
 let test_agent_env_whitelist = fun _ctx ->
@@ -4334,6 +4386,48 @@ let test_agent_exit_reaps_lingering_helpers = fun _ctx ->
       Test.assert_equal ~expected:true ~actual:(Time.Duration.to_millis (Time.Instant.elapsed t0) < 10000);
       Ok ()
 
+let test_agent_finished_turn_does_not_wait = fun _ctx ->
+  let cwd = Env.current_dir () |> Result.unwrap |> Path.to_string in
+  let script = cwd ^ "/packages/oasis/tests/fixtures/fakebin/grok" in
+  let a = mk_agent ~command:script ~args:[] ~timeout_s:0 "agent_grok_done" in
+  let me = self () in
+  let t0 = Time.Instant.now () in
+  let _ =
+    Runtime.spawn_blocked (fun () ->
+      let res = Agent.collect ~agent:a ~model:"" ~prompt:"" () in
+      send me (Agent_collect_done res);
+      Ok ())
+  in
+  let selector msg = match msg with Agent_collect_done r -> Select r | _ -> Skip in
+  match receive ~selector ~timeout:(Time.Duration.from_secs 15) () with
+  | exception Receive_timeout -> Error "collect waited for a grok process that had already finished"
+  | Error e -> Error ("expected the finished answer: " ^ e)
+  | Ok text ->
+      Test.assert_equal ~expected:"hi" ~actual:text;
+      Test.assert_equal ~expected:true ~actual:(Time.Duration.to_millis (Time.Instant.elapsed t0) < 8000);
+      Ok ()
+
+let test_agent_idle_after_answer_closes = fun _ctx ->
+  let a =
+    mk_agent ~args:[ "-c"; "printf '%s\\n' 'plain answer'; sleep 30" ] ~timeout_s:0 "agent_idle"
+  in
+  let me = self () in
+  let t0 = Time.Instant.now () in
+  let _ =
+    Runtime.spawn_blocked (fun () ->
+      let res = Agent.collect ~idle_s:1 ~agent:a ~model:"" ~prompt:"" () in
+      send me (Agent_collect_done res);
+      Ok ())
+  in
+  let selector msg = match msg with Agent_collect_done r -> Select r | _ -> Skip in
+  match receive ~selector ~timeout:(Time.Duration.from_secs 15) () with
+  | exception Receive_timeout -> Error "collect waited on a silent agent that already answered"
+  | Error e -> Error ("expected the answer already written: " ^ e)
+  | Ok text ->
+      Test.assert_equal ~expected:"plain answer\n" ~actual:text;
+      Test.assert_equal ~expected:true ~actual:(Time.Duration.to_millis (Time.Instant.elapsed t0) < 8000);
+      Ok ()
+
 let tests =
   Test.[
     case "chunked decoding: single chunk" test_chunked_single_chunk;
@@ -4380,6 +4474,8 @@ let tests =
     case "steps: answer joins messages and post-tool text" test_steps_answer_join;
     case "steps: clip keeps utf-8 valid" test_steps_clip_utf8;
     case ~size:Test.Large "agent: exit reaps helpers that keep stdout open" test_agent_exit_reaps_lingering_helpers;
+    case ~size:Test.Large "agent: a finished grok turn is closed" test_agent_finished_turn_does_not_wait;
+    case ~size:Test.Large "agent: silence after an answer closes the run" test_agent_idle_after_answer_closes;
     case "classify: prompt content to category" test_classify_prompts;
     case "router: latency scored relative to the fastest" test_router_relative_latency;
     case "router: best goal avoids a very slow account" test_router_best_avoids_very_slow;
@@ -4388,6 +4484,7 @@ let tests =
     case "committee: members and feed events" test_committee_members_and_feed;
     case "gateway: committee answers and synthesis" test_gateway_committee;
     case "gateway: committee can include an agent" test_gateway_committee_includes_agent;
+    case "gateway: committee uses the requested workdir" test_committee_uses_requested_workdir;
     case "gateway: thread follow-up carries the conversation" test_gateway_thread_carries_history;
     case ~size:Test.Large "agent: tree dies with the gateway" test_agent_dies_with_gateway;
     case "thread: running turns become interrupted on restart" test_thread_marks_interrupted_turns;
