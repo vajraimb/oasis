@@ -432,41 +432,60 @@ let is_key_name = fun name ->
 let value_is_literal = fun v ->
   not (String.contains v "$") && not (String.contains v "`") && not (String.contains v "\n")
 
+let unquoted_shell_value = fun raw ->
+  match String.split ~by:" #" raw with [] -> raw | first :: _ -> String.trim first
+
 (** The value of one shell assignment. A quoted value ends at its closing
     quote, so a trailing comment is dropped and a hash inside the key is
-    kept. An unquoted value is cut at [ #]. *)
+    kept. An unquoted value is cut at [ #]. An empty or one-character value
+    is not indexed: [export NAME=] and a bare [=] are normal in bashrc, and
+    [String.get] on them raises [Invalid_argument]. *)
 let shell_assignment_value = fun raw ->
   let n = String.length raw in
-  if n >= 2 && (Char.equal (String.get_unchecked raw ~at:0) '"' || Char.equal (String.get_unchecked raw ~at:0) '\'') then
-    let q = String.get_unchecked raw ~at:0 in
-    let rec close i =
-      if i >= n then ""
-      else if Char.equal (String.get_unchecked raw ~at:i) q then String.sub raw ~offset:1 ~len:(i - 1)
-      else close (i + 1)
-    in
-    close 1
-  else match String.split ~by:" #" raw with [] -> raw | first :: _ -> String.trim first
+  if n < 2 then
+    match String.get raw ~at:0 with
+    | Some q when Char.equal q '"' || Char.equal q '\'' -> ""
+    | _ -> unquoted_shell_value raw
+  else
+    match String.get raw ~at:0 with
+    | Some q when Char.equal q '"' || Char.equal q '\'' ->
+        let rec close i =
+          if i >= n then ""
+          else
+            match String.get raw ~at:i with
+            | Some c when Char.equal c q -> String.sub raw ~offset:1 ~len:(i - 1)
+            | _ -> close (i + 1)
+        in
+        close 1
+    | _ -> unquoted_shell_value raw
 
 (** [export] lines from a shell startup file. The file is not executed.
     A login shell never reads [~/.bashrc], and Ubuntu's bashrc returns
     immediately when the shell is not interactive, which hides every key
     written below that guard. *)
+let parse_shell_assignment = fun line ->
+  let line = String.trim line in
+  let line =
+    if String.starts_with ~prefix:"export " line then String.trim (String.sub line ~offset:7 ~len:(String.length line - 7))
+    else line
+  in
+  if String.is_empty line || String.starts_with ~prefix:"#" line then None
+  else
+    match String.index_of line ~char:'=' with
+    | None -> None
+    | Some i ->
+        let k = String.trim (String.sub line ~offset:0 ~len:i) in
+        let v = shell_assignment_value (String.trim (String.sub line ~offset:(i + 1) ~len:(String.length line - i - 1))) in
+        if valid_env_name k && is_key_name k && not (String.is_empty v) && value_is_literal v then Some (k, v) else None
+
+(** One bad line is skipped. A throw used to abort [load_secrets] before
+    [secrets.env] was read, so the access token never reached the process. *)
 let parse_shell_rc = fun content ->
   String.split ~by:"\n" content
   |> List.filter_map ~fn:(fun line ->
-    let line = String.trim line in
-    let line =
-      if String.starts_with ~prefix:"export " line then String.trim (String.sub line ~offset:7 ~len:(String.length line - 7))
-      else line
-    in
-    if String.is_empty line || String.starts_with ~prefix:"#" line then None
-    else
-      match String.index_of line ~char:'=' with
-      | None -> None
-      | Some i ->
-          let k = String.trim (String.sub line ~offset:0 ~len:i) in
-          let v = shell_assignment_value (String.trim (String.sub line ~offset:(i + 1) ~len:(String.length line - i - 1))) in
-          if valid_env_name k && is_key_name k && not (String.is_empty v) && value_is_literal v then Some (k, v) else None)
+    try parse_shell_assignment line with
+    | Invalid_argument _ -> None
+    | Failure _ -> None)
 
 let shell_rc_paths = fun () ->
   match Env.var Env.String ~name:"HOME" with
@@ -478,16 +497,20 @@ let shell_rc_paths = fun () ->
     applied after this and wins over both. *)
 let load_shell_rc = fun () ->
   List.for_each (shell_rc_paths ()) ~fn:(fun path ->
-    match Path.from_string path with
-    | Error _ -> ()
-    | Ok p -> (
-        match Fs.read_to_string p with
-        | Error _ -> ()
-        | Ok c ->
-            List.for_each (parse_shell_rc c) ~fn:(fun (k, v) ->
-              match Env.var Env.String ~name:k with
-              | Some existing when not (String.is_empty (String.trim existing)) -> ()
-              | _ -> ignore (Env.set ~var:k ~value:v))))
+    try
+      match Path.from_string path with
+      | Error _ -> ()
+      | Ok p -> (
+          match Fs.read_to_string p with
+          | Error _ -> ()
+          | Ok c ->
+              List.for_each (parse_shell_rc c) ~fn:(fun (k, v) ->
+                match Env.var Env.String ~name:k with
+                | Some existing when not (String.is_empty (String.trim existing)) -> ()
+                | _ -> ignore (Env.set ~var:k ~value:v)))
+    with
+    | Invalid_argument _ -> ()
+    | Failure _ -> ())
 
 (** secrets.env is Oasis's own key store, written by the setup wizard, so
     its values take precedence over the inherited environment and over

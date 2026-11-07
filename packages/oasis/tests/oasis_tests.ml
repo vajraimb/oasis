@@ -4004,6 +4004,16 @@ let test_setup_parse_shell_rc = fun _ctx ->
     ^ "OTHER=nope\n"
     ^ "export BROKEN_API_KEY=$(cat /tmp/k)\n"
     ^ "GLM_WORK_KEY=glm-1\n"
+    ^ "=\nexport =\nexport EMPTY_API_KEY=\nexport OPENAI_API_KEY=\"\nexport ANTHROPIC_API_KEY='\n"
+    ^ "export MOONSHOT_API_KEY=\"abc\n"
+    ^ "PS1='${debian_chroot:+($debian_chroot)}\\[\\033[01;32m\\]\\u@\\h\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '\n"
+    ^ "PS1=\"\\[\\e]0;${debian_chroot:+($debian_chroot)}\\u@\\h: \\w\\a\\]$PS1\"\n"
+    ^ "[ -x /usr/bin/lesspipe ] && eval \"$(SHELL=/bin/sh lesspipe)\"\n"
+    ^ "alias ls='ls --color=auto'\n"
+    ^ "alias grep='grep --color=auto'\n"
+    ^ "export PATH=\"$PATH:$HOME/bin\"\n"
+    ^ "export LESSOPEN=\"| /usr/bin/lesspipe %s\"\n"
+    ^ "export LESS=' -R '\n"
   in
   Test.assert_equal
     ~expected:[ ("DEEPSEEK_API_KEY", "sk-test"); ("GLM_WORK_KEY", "glm-1") ]
