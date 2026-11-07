@@ -4,7 +4,7 @@
 #   scripts/oasis.sh <anything else>   runs the oasis binary with those args
 # Runtime files live in $OASIS_HOME (default ~/.oasis): oasis.toml, data/,
 # workspaces/, logs/oasis.log, oasis.pid. API keys come from the calling
-# shell's environment, so run this from a shell that has them exported.
+# shell's environment and from export lines in the user's shell rc files.
 set -e
 
 OASIS_HOME="${OASIS_HOME:-$HOME/.oasis}"

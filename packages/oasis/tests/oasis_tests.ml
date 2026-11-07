@@ -3995,6 +3995,21 @@ let test_setup_parse_secrets = fun _ctx ->
     ~actual:(Setup.parse_secrets "# c\nexport A_KEY=x1\nB=\"two words\"\n\nC='q'd'\n1BAD=no\nnot a line\n");
   Ok ()
 
+let test_setup_parse_shell_rc = fun _ctx ->
+  let src =
+    "# If not running interactively, don't do anything\n"
+    ^ "case $- in\n*i*) ;;\n*) return;;\nesac\n"
+    ^ "export PATH=/usr/bin\n"
+    ^ "export DEEPSEEK_API_KEY=\"sk-test\" # kept off git\n"
+    ^ "OTHER=nope\n"
+    ^ "export BROKEN_API_KEY=$(cat /tmp/k)\n"
+    ^ "GLM_WORK_KEY=glm-1\n"
+  in
+  Test.assert_equal
+    ~expected:[ ("DEEPSEEK_API_KEY", "sk-test"); ("GLM_WORK_KEY", "glm-1") ]
+    ~actual:(Setup.parse_shell_rc src);
+  Ok ()
+
 let test_redact_secrets = fun _ctx ->
   Test.assert_equal
     ~expected:"auth failed for Bearer ****, retry"
@@ -4562,6 +4577,7 @@ let tests =
     case "setup: merge toggles, adds, extends routes, keeps user lines" test_setup_merge_changes;
     case "setup: fresh config keeps skeleton order" test_setup_fresh_skeleton_order;
     case "setup: secrets.env parsing" test_setup_parse_secrets;
+    case "setup: shell rc key exports" test_setup_parse_shell_rc;
     case "setup: model specs from the catalog and name heuristics" test_setup_spec_for;
     case "audit: secret redaction and hash8" test_redact_secrets;
     case ~size:Test.Large "gateway: audit log and errors carry no content or keys" test_gateway_audit_has_no_content_or_keys;

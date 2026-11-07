@@ -167,21 +167,17 @@ scripts/oasis.sh --self-test
 
 If the self-test still fails, stop and show the failing lines. Do not start the gateway.
 
-## 6. Start Oasis so it can see the user's keys
+## 6. Start Oasis
 
-API keys the user keeps in `~/.zshrc` or `~/.bashrc` are invisible to the shell you have been using. Start Oasis through a login shell. `scripts/oasis.sh` daemonizes the process, so that login shell exiting does not stop Oasis.
-
-From any directory, pick the block that matches `$SHELL`:
+`scripts/oasis.sh` daemonizes the process, so this shell exiting does not stop Oasis. On startup Oasis reads `export NAME=value` lines for API keys from `~/.bashrc`, `~/.zshrc`, `~/.bash_profile`, `~/.profile` and `~/.zshenv`. It does not run those files. A login shell is not required, and the "return unless interactive" guard at the top of a typical `~/.bashrc` does not hide the keys below it. A variable already set in the environment is left as it is. Keys saved later on the setup page, in `~/.oasis/secrets.env`, win over both.
 
 ```bash
-# zsh, including the macOS default
-zsh -lic 'export PATH="$HOME/.riot/bin:$PATH"; cd "$HOME/oasis" && scripts/oasis.sh start'
-
-# bash
-bash -lc 'export PATH="$HOME/.riot/bin:$PATH"; cd "$HOME/oasis" && scripts/oasis.sh start'
+export PATH="$HOME/.riot/bin:$PATH"
+cd "$HOME/oasis"
+scripts/oasis.sh start
 ```
 
-The line `Oasis 已启动` means the process is alive, not that it is ready. On a first start there is no `~/.oasis/oasis.toml` yet. Oasis probes every provider key it can see in the environment, local Ollama, and installed agent CLIs. That probe takes up to about 40 seconds, and only then does it listen.
+The line `Oasis 已启动` means the process is alive, not that it is ready. On a first start there is no `~/.oasis/oasis.toml` yet. Oasis probes every provider key it found, local Ollama, and installed agent CLIs. That probe takes up to about 40 seconds, and only then does it listen. If that first start already wrote a config with zero accounts, delete `~/.oasis/oasis.toml` and start again so the probe runs once more. Do not delete it when it already lists accounts.
 
 ## 7. Wait until the console answers
 

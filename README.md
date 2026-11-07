@@ -21,7 +21,7 @@ When an account runs out of quota halfway through an answer, it hands the stream
 
 > Accounts live in separate consoles, separate CLIs, and a pile of environment variables.
 
-One local process gathers the API accounts and the local agents into one config and one setup page. The first start finds the keys, the running Ollama, and the installed agents, tests each one, and marks it ✅ working, ⏳ out of quota, or 🚫 rejected or unreachable. You tick what stays. 🔑 Keys stay in the environment, or in an owner-only `secrets.env`. They are not written into the config, and they are not passed to agents.
+One local process gathers the API accounts and the local agents into one config and one setup page. The first start finds the keys, the running Ollama, and the installed agents, tests each one, and marks it ✅ working, ⏳ out of quota, or 🚫 rejected or unreachable. You tick what stays. 🔑 Keys stay in the environment, in `export` lines of `~/.bashrc` or `~/.zshrc`, or in an owner-only `secrets.env`. They are not written into the config, and they are not passed to agents.
 
 ### 👀 See as one
 

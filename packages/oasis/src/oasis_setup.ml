@@ -2,8 +2,9 @@ open Std
 open Std.Collections
 
 (** Setup: a built-in catalog of providers and agents, detection of what
-    this machine already has (API keys in the environment or
-    [~/.oasis/secrets.env], agent CLIs, a local Ollama), live verification
+    this machine already has (API keys in the environment, in [~/.bashrc]
+    or [~/.zshrc], or in [~/.oasis/secrets.env], agent CLIs, a local
+    Ollama), live verification
     of each candidate, and a merge of the user's choices into [oasis.toml]
     that keeps everything else in the file (comments, tuned values, hand
     written entries) as it was. *)
@@ -421,9 +422,78 @@ let read_secrets = fun () ->
   | Error _ -> []
   | Ok p -> (match Fs.read_to_string p with Ok c -> parse_secrets c | Error _ -> [])
 
+(** A name that can hold a provider key: the catalog's variable, or any
+    *_KEY / *_TOKEN / *_SECRET. *)
+let is_key_name = fun name ->
+  let tokens = String.lowercase_ascii name |> String.split ~by:"_" |> List.filter ~fn:(fun t -> not (String.is_empty t)) in
+  List.any tokens ~fn:(fun t -> String.equal t "key" || String.equal t "apikey" || String.equal t "token" || String.equal t "secret")
+  || List.any providers ~fn:(fun p -> String.equal p.env_name name)
+
+let value_is_literal = fun v ->
+  not (String.contains v "$") && not (String.contains v "`") && not (String.contains v "\n")
+
+(** The value of one shell assignment. A quoted value ends at its closing
+    quote, so a trailing comment is dropped and a hash inside the key is
+    kept. An unquoted value is cut at [ #]. *)
+let shell_assignment_value = fun raw ->
+  let n = String.length raw in
+  if n >= 2 && (Char.equal (String.get_unchecked raw ~at:0) '"' || Char.equal (String.get_unchecked raw ~at:0) '\'') then
+    let q = String.get_unchecked raw ~at:0 in
+    let rec close i =
+      if i >= n then ""
+      else if Char.equal (String.get_unchecked raw ~at:i) q then String.sub raw ~offset:1 ~len:(i - 1)
+      else close (i + 1)
+    in
+    close 1
+  else match String.split ~by:" #" raw with [] -> raw | first :: _ -> String.trim first
+
+(** [export] lines from a shell startup file. The file is not executed.
+    A login shell never reads [~/.bashrc], and Ubuntu's bashrc returns
+    immediately when the shell is not interactive, which hides every key
+    written below that guard. *)
+let parse_shell_rc = fun content ->
+  String.split ~by:"\n" content
+  |> List.filter_map ~fn:(fun line ->
+    let line = String.trim line in
+    let line =
+      if String.starts_with ~prefix:"export " line then String.trim (String.sub line ~offset:7 ~len:(String.length line - 7))
+      else line
+    in
+    if String.is_empty line || String.starts_with ~prefix:"#" line then None
+    else
+      match String.index_of line ~char:'=' with
+      | None -> None
+      | Some i ->
+          let k = String.trim (String.sub line ~offset:0 ~len:i) in
+          let v = shell_assignment_value (String.trim (String.sub line ~offset:(i + 1) ~len:(String.length line - i - 1))) in
+          if valid_env_name k && is_key_name k && not (String.is_empty v) && value_is_literal v then Some (k, v) else None)
+
+let shell_rc_paths = fun () ->
+  match Env.var Env.String ~name:"HOME" with
+  | None -> []
+  | Some home when String.is_empty (String.trim home) -> []
+  | Some home -> List.map [ ".bashrc"; ".zshrc"; ".bash_profile"; ".profile"; ".zshenv" ] ~fn:(fun name -> home ^ "/" ^ name)
+
+(** Key assignments already in the environment win. [secrets.env] is
+    applied after this and wins over both. *)
+let load_shell_rc = fun () ->
+  List.for_each (shell_rc_paths ()) ~fn:(fun path ->
+    match Path.from_string path with
+    | Error _ -> ()
+    | Ok p -> (
+        match Fs.read_to_string p with
+        | Error _ -> ()
+        | Ok c ->
+            List.for_each (parse_shell_rc c) ~fn:(fun (k, v) ->
+              match Env.var Env.String ~name:k with
+              | Some existing when not (String.is_empty (String.trim existing)) -> ()
+              | _ -> ignore (Env.set ~var:k ~value:v))))
+
 (** secrets.env is Oasis's own key store, written by the setup wizard, so
-    its values take precedence over the inherited environment. *)
+    its values take precedence over the inherited environment and over
+    shell startup files. *)
 let load_secrets = fun () ->
+  load_shell_rc ();
   let pairs = read_secrets () in
   List.for_each pairs ~fn:(fun (k, v) -> ignore (Env.set ~var:k ~value:v));
   from_secrets := List.map pairs ~fn:(fun (k, _) -> k);
