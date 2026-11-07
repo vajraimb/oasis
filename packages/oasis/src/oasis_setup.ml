@@ -387,7 +387,8 @@ let agent_specs = [
     aid = "hermes";
     alabel = "Hermes";
     command = "hermes";
-    args = [ "chat"; "--oneshot"; "--yolo"; "-Q"; "--query"; "{prompt}" ];
+    (* Hermes 0.16 rejects `chat --oneshot` with exit 2. `--query` with `-Q` is its single-query mode, and later releases still exit on `-Q`. *)
+    args = [ "chat"; "--yolo"; "-Q"; "--query"; "{prompt}" ];
     capabilities = [ "terminal"; "files"; "web" ];
     atier = 4;
     astrengths = [ "coding"; "general" ];

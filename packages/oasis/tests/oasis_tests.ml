@@ -3938,7 +3938,15 @@ let test_bundled_agents_take_a_prompt = fun _ctx ->
         match Oasis.Setup.find_agent_spec id with
         | None -> Error ("missing agent spec " ^ id)
         | Some a ->
-            if List.any a.Oasis.Setup.args ~fn:(String.equal "{prompt}") then go rest else Error ("agent spec has no prompt slot " ^ id)
+            let hermes_ok =
+              if not (String.equal id "hermes") then true
+              else
+                (not (List.any a.Oasis.Setup.args ~fn:(String.equal "--oneshot")))
+                && List.any a.Oasis.Setup.args ~fn:(String.equal "--query")
+                && List.any a.Oasis.Setup.args ~fn:(String.equal "-Q")
+            in
+            if List.any a.Oasis.Setup.args ~fn:(String.equal "{prompt}") && hermes_ok then go rest
+            else Error ("agent spec has no prompt slot " ^ id)
       )
   in
   go ids
