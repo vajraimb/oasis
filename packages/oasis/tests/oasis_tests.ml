@@ -3930,7 +3930,7 @@ let test_observe_ignores_quoted_plan = fun _ctx ->
   Ok ()
 
 let test_bundled_agents_take_a_prompt = fun _ctx ->
-  let ids = [ "codex_cli"; "zcode"; "deepseek_harness"; "workbuddy" ] in
+  let ids = [ "codex_cli"; "zcode"; "deepseek_harness"; "workbuddy"; "openclaw"; "hermes"; "pi" ] in
   let rec go ids =
     match ids with
     | [] -> Ok ()
@@ -4018,6 +4018,22 @@ let test_setup_parse_shell_rc = fun _ctx ->
   Test.assert_equal
     ~expected:[ ("DEEPSEEK_API_KEY", "sk-test"); ("GLM_WORK_KEY", "glm-1") ]
     ~actual:(Setup.parse_shell_rc src);
+  Ok ()
+
+let test_setup_agent_credentials = fun _ctx ->
+  let text =
+    "OPENROUTER_API_KEY=sk-or-1\n"
+    ^ "export PATH=/usr/bin\n"
+    ^ "{ \"anthropic\": { \"type\": \"api_key\", \"key\": \"sk-ant-1\" }, \"openai\": { \"type\": \"oauth\", \"key\": \"ya29\" } }\n"
+    ^ "env: { DEEPSEEK_API_KEY: \"sk-ds-1\", }\n"
+    ^ "\"apiKey\": \"!nope\"\n"
+  in
+  let got =
+    List.sort (Setup.credential_assignments text) ~compare:(fun (a, _) (b, _) -> String.compare a b)
+  in
+  Test.assert_equal
+    ~expected:[ ("ANTHROPIC_API_KEY", "sk-ant-1"); ("DEEPSEEK_API_KEY", "sk-ds-1"); ("OPENROUTER_API_KEY", "sk-or-1") ]
+    ~actual:got;
   Ok ()
 
 let test_redact_secrets = fun _ctx ->
@@ -4588,6 +4604,7 @@ let tests =
     case "setup: fresh config keeps skeleton order" test_setup_fresh_skeleton_order;
     case "setup: secrets.env parsing" test_setup_parse_secrets;
     case "setup: shell rc key exports" test_setup_parse_shell_rc;
+    case "setup: agent configs yield provider keys" test_setup_agent_credentials;
     case "setup: model specs from the catalog and name heuristics" test_setup_spec_for;
     case "audit: secret redaction and hash8" test_redact_secrets;
     case ~size:Test.Large "gateway: audit log and errors carry no content or keys" test_gateway_audit_has_no_content_or_keys;

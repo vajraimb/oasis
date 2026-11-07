@@ -369,6 +369,48 @@ let agent_specs = [
     login_hint = "In a terminal run codebuddy, then /login";
     install_hint = "Install the WorkBuddy app";
   };
+  {
+    aid = "openclaw";
+    alabel = "OpenClaw";
+    command = "openclaw";
+    args = [ "agent"; "exec"; "--timeout"; "0"; "{prompt}" ];
+    capabilities = [ "terminal"; "files"; "web" ];
+    atier = 4;
+    astrengths = [ "coding"; "general" ];
+    acontext = 200000;
+    alatency = "slow";
+    env_passthrough = [];
+    login_hint = "openclaw models auth paste-token";
+    install_hint = "curl -fsSL https://openclaw.ai/install.sh | bash";
+  };
+  {
+    aid = "hermes";
+    alabel = "Hermes";
+    command = "hermes";
+    args = [ "chat"; "--oneshot"; "--yolo"; "-Q"; "--query"; "{prompt}" ];
+    capabilities = [ "terminal"; "files"; "web" ];
+    atier = 4;
+    astrengths = [ "coding"; "general" ];
+    acontext = 200000;
+    alatency = "slow";
+    env_passthrough = [];
+    login_hint = "hermes model";
+    install_hint = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash";
+  };
+  {
+    aid = "pi";
+    alabel = "Pi";
+    command = "pi";
+    args = [ "--print"; "--approve"; "--"; "{prompt}" ];
+    capabilities = [ "terminal"; "files"; "web" ];
+    atier = 4;
+    astrengths = [ "coding"; "general" ];
+    acontext = 200000;
+    alatency = "slow";
+    env_passthrough = [];
+    login_hint = "pi auth login";
+    install_hint = "curl -fsSL https://pi.dev/install.sh | sh";
+  };
 ]
 
 let find_agent_spec = fun aid -> List.find agent_specs ~fn:(fun a -> String.equal a.aid aid)
@@ -487,27 +529,247 @@ let parse_shell_rc = fun content ->
     | Invalid_argument _ -> None
     | Failure _ -> None)
 
+let slice = fun s ~start ~len ->
+  let n = String.length s in
+  if start < 0 || len < 0 || start > n - len then "" else String.sub s ~offset:start ~len
+
+let is_ident_start = fun c ->
+  (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || Char.equal c '_'
+
+let is_ident_cont = fun c -> is_ident_start c || (c >= '0' && c <= '9')
+
+let skip_ws = fun s i n ->
+  let rec go i =
+    if i >= n then i
+    else
+      match String.get s ~at:i with
+      | Some c when Char.equal c ' ' || Char.equal c '\t' || Char.equal c '\n' || Char.equal c '\r' -> go (i + 1)
+      | _ -> i
+  in
+  go i
+
+let read_json_string = fun s i n ->
+  let rec go j acc =
+    if j >= n then None
+    else
+      match String.get s ~at:j with
+      | None -> None
+      | Some '"' -> Some (acc, j + 1)
+      | Some '\\' -> (
+          match String.get s ~at:(j + 1) with
+          | None -> None
+          | Some c -> go (j + 2) (acc ^ String.from_char c)
+        )
+      | Some c -> go (j + 1) (acc ^ String.from_char c)
+  in
+  match String.get s ~at:i with
+  | Some '"' -> go (i + 1) ""
+  | _ -> None
+
+let read_ident = fun s i n ->
+  let rec go j =
+    if j >= n then j
+    else
+      match String.get s ~at:j with
+      | Some c when is_ident_cont c -> go (j + 1)
+      | _ -> j
+  in
+  let j = go i in
+  if j = i then None else Some (slice s ~start:i ~len:(j - i), j)
+
+let usable_secret = fun v ->
+  let v = String.trim v in
+  (not (String.is_empty v))
+  && value_is_literal v
+  && not (String.starts_with ~prefix:"!" v)
+  && not (String.starts_with ~prefix:"secretref" (String.lowercase_ascii v))
+
+(** Provider id as it appears in Pi's auth.json and OpenClaw's config, and
+    the environment variable Oasis already knows for that provider. *)
+let provider_env_names = [
+  ("openrouter", "OPENROUTER_API_KEY");
+  ("siliconflow", "SILICONFLOW_API_KEY");
+  ("perplexity", "PERPLEXITY_API_KEY");
+  ("anthropic", "ANTHROPIC_API_KEY");
+  ("deepseek", "DEEPSEEK_API_KEY");
+  ("dashscope", "DASHSCOPE_API_KEY");
+  ("moonshot", "MOONSHOT_API_KEY");
+  ("gemini", "GEMINI_API_KEY");
+  ("google", "GEMINI_API_KEY");
+  ("mistral", "MISTRAL_API_KEY");
+  ("openai", "OPENAI_API_KEY");
+  ("groq", "GROQ_API_KEY");
+  ("qwen", "DASHSCOPE_API_KEY");
+  ("zai", "ZAI_API_KEY");
+  ("glm", "ZAI_API_KEY");
+  ("xai", "XAI_API_KEY");
+  ("grok", "XAI_API_KEY");
+  ("kimi", "MOONSHOT_API_KEY");
+]
+
+let bounded_at = fun hay needle at ->
+  let n = String.length hay in
+  let m = String.length needle in
+  if at < 0 || m = 0 || at > n - m then false
+  else if not (String.equal (slice hay ~start:at ~len:m) needle) then false
+  else
+    let before_ok =
+      if at = 0 then true
+      else
+        match String.get hay ~at:(at - 1) with
+        | Some c -> not (is_ident_cont c)
+        | None -> true
+    in
+    let after_ok =
+      let j = at + m in
+      if j >= n then true
+      else
+        match String.get hay ~at:j with
+        | Some c -> not (is_ident_cont c)
+        | None -> true
+    in
+    before_ok && after_ok
+
+let last_bounded = fun hay needle ->
+  let n = String.length hay in
+  let m = String.length needle in
+  let rec go i found =
+    if i > n - m then found
+    else if bounded_at hay needle i then go (i + 1) (Some i)
+    else go (i + 1) found
+  in
+  if m = 0 || m > n then None else go 0 None
+
+let provider_in_window = fun window ->
+  let hay = String.lowercase_ascii window in
+  if Option.is_some (last_bounded hay "oauth") then None
+  else
+    let rec best names winner =
+      match names with
+      | [] -> winner
+      | (needle, env) :: rest ->
+          let winner =
+            match last_bounded hay needle, winner with
+            | Some at, None -> Some (at, env)
+            | Some at, Some (prev, _) when at >= prev -> Some (at, env)
+            | _ -> winner
+          in
+          best rest winner
+    in
+    best provider_env_names None |> Option.map ~fn:(fun (_, env) -> env)
+
+let string_after_colon = fun s j n ->
+  let j = skip_ws s j n in
+  match String.get s ~at:j with
+  | Some ':' -> (
+      let k = skip_ws s (j + 1) n in
+      match read_json_string s k n with
+      | Some (value, next) when usable_secret value -> Some (String.trim value, next)
+      | Some (_, next) -> Some ("", next)
+      | None -> None
+    )
+  | _ -> None
+
+(** API keys written inside an agent config: a shell [.env], a JSON object
+    such as Pi's auth.json, or JSON5 such as OpenClaw's openclaw.json.
+    Command-backed keys ([!...]) and OAuth tokens are not API keys. *)
+let credential_assignments = fun content ->
+  let from_env = parse_shell_rc content in
+  let n = String.length content in
+  let rec scan i acc =
+    if i >= n then List.reverse acc
+    else
+      match String.get content ~at:i with
+      | Some '"' -> (
+          match read_json_string content i n with
+          | None -> scan (i + 1) acc
+          | Some (token, j) -> (
+              match string_after_colon content j n with
+              | None -> scan j acc
+              | Some ("", next) -> scan next acc
+              | Some (value, next) ->
+                  let named_secret = String.equal token "apiKey" || String.equal token "api_key" || String.equal token "key" in
+                  let acc =
+                    if named_secret then
+                      let start = if i > 240 then i - 240 else 0 in
+                      match provider_in_window (slice content ~start ~len:(i - start)) with
+                      | Some env -> (env, value) :: acc
+                      | None -> acc
+                    else if valid_env_name token && is_key_name token then (token, value) :: acc
+                    else acc
+                  in
+                  scan next acc
+            )
+        )
+      | Some c when is_ident_start c -> (
+          match read_ident content i n with
+          | None -> scan (i + 1) acc
+          | Some (token, j) -> (
+              match string_after_colon content j n with
+              | Some (value, next) when not (String.is_empty value) && valid_env_name token && is_key_name token ->
+                  scan next ((token, value) :: acc)
+              | Some (_, next) -> scan next acc
+              | None -> scan (i + 1) acc
+            )
+        )
+      | _ -> scan (i + 1) acc
+  in
+  from_env @ scan 0 []
+
 let shell_rc_paths = fun () ->
   match Env.var Env.String ~name:"HOME" with
   | None -> []
   | Some home when String.is_empty (String.trim home) -> []
   | Some home -> List.map [ ".bashrc"; ".zshrc"; ".bash_profile"; ".profile"; ".zshenv" ] ~fn:(fun name -> home ^ "/" ^ name)
 
+let set_if_unset = fun k v ->
+  match Env.var Env.String ~name:k with
+  | Some existing when not (String.is_empty (String.trim existing)) -> ()
+  | _ -> ignore (Env.set ~var:k ~value:v)
+
+let read_text = fun path ->
+  match Path.from_string path with
+  | Error _ -> None
+  | Ok p -> (match Fs.read_to_string p with Ok c -> Some c | Error _ -> None)
+
+let dir_or = fun var ~default ->
+  match Env.var Env.String ~name:var with
+  | Some h when not (String.is_empty (String.trim h)) -> String.trim h
+  | _ -> default
+
+(** Keys these agents keep in their own files. The process environment and
+    [secrets.env] stay in charge when they already name the same variable. *)
+let load_agent_keys = fun () ->
+  let home = Oasis_config.user_home () in
+  let files =
+    [
+      dir_or "HERMES_HOME" ~default:(home ^ "/.hermes") ^ "/.env";
+      dir_or "OPENCLAW_STATE_DIR" ~default:(home ^ "/.openclaw") ^ "/.env";
+      dir_or "OPENCLAW_STATE_DIR" ~default:(home ^ "/.openclaw") ^ "/openclaw.json";
+      dir_or "PI_CODING_AGENT_DIR" ~default:(home ^ "/.pi/agent") ^ "/auth.json";
+      dir_or "PI_CODING_AGENT_DIR" ~default:(home ^ "/.pi/agent") ^ "/models.json";
+    ]
+  in
+  List.for_each files ~fn:(fun path ->
+    try
+      (match read_text path with
+       | None -> ()
+       | Some content -> List.for_each (credential_assignments content) ~fn:(fun (k, v) -> set_if_unset k v))
+    with
+    | Invalid_argument _ -> ()
+    | Failure _ -> ())
+
 (** Key assignments already in the environment win. [secrets.env] is
-    applied after this and wins over both. *)
+    applied after this and wins over the shell files and the agent files. *)
 let load_shell_rc = fun () ->
   List.for_each (shell_rc_paths ()) ~fn:(fun path ->
     try
-      match Path.from_string path with
-      | Error _ -> ()
-      | Ok p -> (
-          match Fs.read_to_string p with
-          | Error _ -> ()
-          | Ok c ->
-              List.for_each (parse_shell_rc c) ~fn:(fun (k, v) ->
-                match Env.var Env.String ~name:k with
-                | Some existing when not (String.is_empty (String.trim existing)) -> ()
-                | _ -> ignore (Env.set ~var:k ~value:v)))
+      (match Path.from_string path with
+       | Error _ -> ()
+       | Ok p -> (
+           match Fs.read_to_string p with
+           | Error _ -> ()
+           | Ok c -> List.for_each (parse_shell_rc c) ~fn:(fun (k, v) -> set_if_unset k v)))
     with
     | Invalid_argument _ -> ()
     | Failure _ -> ())
@@ -517,6 +779,7 @@ let load_shell_rc = fun () ->
     shell startup files. *)
 let load_secrets = fun () ->
   load_shell_rc ();
+  load_agent_keys ();
   let pairs = read_secrets () in
   List.for_each pairs ~fn:(fun (k, v) -> ignore (Env.set ~var:k ~value:v));
   from_secrets := List.map pairs ~fn:(fun (k, _) -> k);

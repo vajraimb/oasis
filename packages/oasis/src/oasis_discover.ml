@@ -45,6 +45,9 @@ let locate_command = fun ~home cmd ->
     path_dirs
     @ [
       home ^ "/.local/bin";
+      home ^ "/.hermes/bin";
+      home ^ "/.hermes/hermes-agent/venv/bin";
+      home ^ "/.pi/bin";
       home ^ "/bin";
       home ^ "/.npm-global/bin";
       home ^ "/.bun/bin";
@@ -227,5 +230,14 @@ let scan = fun ~home ->
       (None, []);
     mk "cursor_agent" "cursor-agent" (find_command ~home "cursor-agent")
       (file_exists (home ^ "/.cursor/cli-config.json"))
+      (None, []);
+    mk "openclaw" "openclaw" (find_command ~home "openclaw")
+      (dir_exists (home ^ "/.openclaw"))
+      (None, []);
+    mk "hermes" "hermes" (find_command ~home "hermes")
+      (file_exists (home ^ "/.hermes/.env") || dir_exists (home ^ "/.hermes"))
+      (None, []);
+    mk "pi" "pi" (find_command ~home "pi")
+      (file_exists (home ^ "/.pi/agent/auth.json") || dir_exists (home ^ "/.pi/agent"))
       (None, []);
   ]

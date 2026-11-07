@@ -116,7 +116,7 @@ open http://127.0.0.1:9899/                         # 配置页会自动弹出
 
 - 环境变量里的 API key，覆盖 13 家服务商：DeepSeek、Kimi、GLM、OpenRouter、Perplexity、通义千问（DashScope）、OpenAI、Anthropic、Gemini、xAI、Groq、Mistral、硅基流动。`DEEPSEEK_API_KEY`、`OPENROUTER_API_KEY` 这类标准名能识别，`glm_work_key` 这种自己起的名字也能识别。每个 key 都会实测；对有多个端点的服务商（Kimi Coding 与 Moonshot、国内站与国际站），Oasis 会留下能用的那个；
 - 正在运行的 Ollama 里的本地模型和云端模型；
-- 已安装的 Claude Code、Cursor Agent、Gemini CLI、Kimi CLI、Grok CLI。
+- 已安装的 Claude Code、Cursor Agent、Gemini CLI、Kimi CLI、Grok CLI、OpenClaw、Hermes、Pi。OpenClaw、Hermes、Pi 自己保存的 key 会从它们的配置里读出来。
 
 接着，控制台里的配置页会列出每个账户的状态：可用、限流中、额度用完、key 无效或连不上。取消勾选不想用的，给还没配置的服务商粘贴 key，选一个路由目标，点 **保存并开始**。之后随时可以从 **设置** 按钮重新打开。它在你现有的配置上原地修改：手写的条目、注释和调过的数值都保持原样，修改前的版本存为 `oasis.toml.bak`。配置页跟随浏览器语言，显示中文或英文。
 

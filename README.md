@@ -116,7 +116,7 @@ On the first start Oasis writes `~/.oasis/oasis.toml` from what it finds:
 
 - API keys in your environment for 13 providers: DeepSeek, Kimi, GLM, OpenRouter, Perplexity, Qwen (DashScope), OpenAI, Anthropic, Gemini, xAI, Groq, Mistral and SiliconFlow. The standard names such as `DEEPSEEK_API_KEY` and `OPENROUTER_API_KEY` are found, and so are your own names like `glm_work_key`. Each key is tested live, and for providers with several endpoints (Kimi Coding vs. Moonshot, China vs. international) Oasis keeps the one that works;
 - local and cloud models in a running Ollama;
-- Claude Code, Cursor Agent, Gemini CLI, Kimi CLI and Grok CLI, if installed.
+- Claude Code, Cursor Agent, Gemini CLI, Kimi CLI, Grok CLI, OpenClaw, Hermes and Pi, if installed. A key saved inside OpenClaw, Hermes or Pi is picked up from that agent's own config.
 
 The setup page in the dashboard then shows each account's status: works, rate limited, out of quota, invalid key or unreachable. Untick anything you don't want, paste keys for providers you haven't set up yet, choose a routing goal and press **Save & start**. You can reopen it any time from the **Setup** button. It edits your existing config in place: hand-written entries, comments and tuned values stay as they are, and the previous version is kept as `oasis.toml.bak`. The page is in English or Chinese, following your browser.
 
