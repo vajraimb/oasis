@@ -229,6 +229,7 @@ packages/
 └── oasis/     网关本体：src/oasis_*.ml、tests/、bench/、examples/（模拟上游、HTTPS 探针）
 config/        oasis.example.toml、oasis-demo.toml（对着本机模拟上游的无 key 演示）
 scripts/       oasis.sh、build-release.sh、patch-riot.sh
+AGENTS.md      给 Cursor、Codex、Claude Code 自动读的短说明
 docs/          agent-setup.md：编程助手照着做，装好 Oasis 并打开控制台
 patches/riot/  Riot kernel/std 补丁（CI 和本地构建都会打）
 ```

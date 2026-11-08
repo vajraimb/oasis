@@ -229,6 +229,7 @@ packages/
 └── oasis/     the gateway: src/oasis_*.ml, tests/, bench/, examples/ (mock upstream, HTTPS probe)
 config/        oasis.example.toml, oasis-demo.toml (keyless demo against local mocks)
 scripts/       oasis.sh, build-release.sh, patch-riot.sh
+AGENTS.md      short instructions loaded by Cursor, Codex, and Claude Code
 docs/          agent-setup.md is the runbook a coding agent follows to install Oasis and open the console
 patches/riot/  Riot kernel/std patches applied by CI and local builds
 ```
