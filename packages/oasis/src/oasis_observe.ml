@@ -404,6 +404,21 @@ let error_code = fun body ->
 
 let now_s = fun () -> Time.SystemTime.to_unix_timestamp (Time.SystemTime.now ())
 
+let reap_close = fun proc ->
+  let rec go n =
+    match Process.try_wait proc with
+    | Ok (Some (Process.Exited _ | Process.Signaled _)) | Error _ -> ()
+    | Ok None | Ok (Some (Process.Running | Process.Stopped _)) ->
+        if n <= 0 then ()
+        else (
+          sleep (Time.Duration.from_millis 10);
+          go (n - 1)
+        )
+  in
+  go 200;
+  let _ = Process.close proc in
+  ()
+
 let capture = fun ~program ~args ~timeout_s ->
   let stdio = { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Pipe; stderr = Process.Stderr.Null } in
   match Process.spawn ~program ~args ~stdio () with
@@ -444,7 +459,7 @@ let capture = fun ~program ~args ~timeout_s ->
         )
       in
       loop ();
-      let _ = Process.close proc in
+      reap_close proc;
       Some !buf
 
 let argv = fun items -> Array.init ~count:(List.length items) ~fn:(fun i -> List.get_unchecked items ~at:i)

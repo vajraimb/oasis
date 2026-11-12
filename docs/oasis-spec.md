@@ -187,6 +187,7 @@ EMA 与样本数持久化到 `~/.oasis/data/latency.json`（每个 `task_done` �
   （`POST /api/feed/cancel {"id"}`）。两者都走同一条取消路径：杀掉 agent 进程树 / 放弃等待上游，
   **不换下一个候选、不扣执行者健康分**，任务状态为 `cancelled`，返回 499（流式以 `oasis_cancelled` 错误 + `[DONE]` 收尾）。
   仍保留的只有"连接已死"判定：流式上游 120s 没有任何字节视为断线（这是健康检查，不是时长限制）。
+  委员会的每一席是例外，见下文「委员会」。
   agent 的 `timeout_s` 默认 0（不限）；配置了正数才会有看门狗。Oasis 自己的后台抽检（judge）单次 300s 上限
 - **非流式**：按回退链逐个尝试（blocking lane），全程记账/信号/决策记录
 - **流式（账户）**：导体 actor 管理当前 leg；上游断流/错误 → 触发 handoff（§3）。
@@ -202,7 +203,9 @@ EMA 与样本数持久化到 `~/.oasis/data/latency.json`（每个 `task_done` �
   的 JSON 事件流解析成工作步骤（`thinking` / `text` / `tool` / `tool_result` / `usage`），非 JSON 行与未知 CLI
   按纯文本处理。只有 `text` 进入客户端 delta（末尾 `result` 是全文重复，丢弃；整条消息之间、工具调用后续写的
   文字之间插空行）；思考与工具步骤**不进回答**，作为 `agent_step` 事件广播给控制台（§2.6）。
-  心跳保活（10s 空 chunk）；取消或（配置了 `timeout_s` 时）看门狗 SIGKILL：子进程由 perl 包装成为进程组组长，
+  心跳保活（10s 空 chunk）。标准输出和标准错误连续 120 秒没有任何字节时，视为进程已不再工作，杀掉进程树并记失败
+  （grok 为 600 秒，它在两次输出之间会想比较久）。已经写出正文后再沉默，按已有回答收口，不记失败。这不是任务总时限：只要还在输出，就可以一直做下去。
+  取消或（配置了 `timeout_s` 时）看门狗 SIGKILL：子进程由 perl 包装成为进程组组长，
   杀的是**整棵进程树**——先按 ppid 收集全部后代再杀，因为 grok 等 CLI 把工具命令放进各自独立的进程组，只杀组会留下仍在跑的工具进程
   （gemini 等 CLI 会 re-exec 出子 node 进程，只杀父进程会留下孤儿）。perl 包装在 agent 退出后**清理同组残留进程**
   再以 agent 的退出码退出——cursor-agent 会留下继承了 stdout 的后台 worker-server，不清理则管道永不 EOF，
@@ -211,10 +214,12 @@ EMA 与样本数持久化到 `~/.oasis/data/latency.json`（每个 `task_done` �
   running/done/failed——解决"MCP 客户端超时 < agent 执行时长"的矛盾
 - **指定 agent**（`X-Oasis-Agent: <name>`）：强制 agent 模式，只用这一个 agent——不探索、不替换，
   它不可用就直接失败（控制台：Agent 模式下类别选「自选」）
-- **委员会**（`X-Oasis-Committee: a,b[,c]`，2–3 个 API 账户，去重）：各成员并行做一次非流式调用（不设时限，可停止），
-  每家答完即推 `committee_member` 事件；≥2 家成功后按 `analysis` 类别 + 请求的 goal 由路由器挑汇总模型
-  （可以是成员之一，失败按回退链换下一个），回答 = `## 汇总（X）` + 汇总 + 各家原文；只有 1 家成功则直接返回原文，
-  全失败 502。始终非流式返回，`oasis` 字段列出成员成败与汇总者（控制台：问答模式下类别选「委员会」，多选成员）
+- **委员会**（`X-Oasis-Committee: a,b[,c]`，2–3 个账户或 agent，去重）：各成员并行做一次非流式调用。
+  每一席有时限：请求头 `X-Oasis-Timeout`，否则 180 秒。到点只取消这一席（agent 会杀掉进程树），时间线记失败，
+  已经回来的回答照常汇总；停止按钮仍取消整场。每家答完即推 `committee_member` 事件；≥2 家成功后按 `analysis`
+  类别 + 请求的 goal 由路由器挑汇总模型（可以是成员之一，失败按回退链换下一个，汇总本身也受同一时限，
+  超时则直接给出各家原文），回答 = `## 汇总（X）` + 汇总 + 各家原文；只有 1 家成功则直接返回原文，
+  全失败 502。`oasis` 字段列出成员成败与汇总者（控制台：问答模式下类别选「委员会」，多选成员）
 
 #### 2.4.1 失败分类与熔断 **[0.3 新增]**
 
@@ -225,8 +230,8 @@ daily 语义）是**每 30s 烧一次请求并污染时延 EMA**。0.3 区分三
 | 类别 | 识别规则 | 处理 |
 |---|---|---|
 | **transient**（瞬时） | 5xx、连接失败、读超时、流中断且无配额特征 | 现有熔断：窗口错误率或连续 5 次 → Open 30s → Half_open 单探测 |
-| **quota**（配额/余额） | HTTP 429 且 body 含 `1113` / `insufficient_quota` / `balance` / `credit`；HTTP 402；provider 自定义码表（配置 `quota_error_codes`） | `parked_until` = 下一 UTC 日 00:00（日配额）或下月 1 日（月预算，由错误文本/配置决定，默认日）；停牌期间视为硬约束不通过，reject 原因 `quota_parked`；不计入时延 EMA |
-| **client**（请求本身错） | 4xx 非 429/402（400 参数错、401/403 密钥错、413 过长） | 不触发熔断；401/403 额外写 `auth_invalid` 信号并在 `/api/accounts` 显示；不进入回退链（换账户也会失败的错误除外：413 可回退到更大 context 的账户） |
+| **quota**（配额/余额） | HTTP 402；HTTP 429 或 403 且 body 含 `1113` / `insufficient_quota` / `balance` / `credit` / `quota` / `余额`；provider 自定义码表（配置 `quota_error_codes`） | `parked_until` = 下一 UTC 日 00:00（日配额）或下月 1 日（月预算，由配置 `quota_reset` 决定，默认日）；停牌期间视为硬约束不通过，reject 原因 `quota_parked`；不计入时延 EMA；并清掉此前的 `auth_invalid` |
+| **client**（请求本身错） | 4xx 非 429/402（400 参数错、401 密钥错、403 且正文看不出额度、413 过长） | 不触发熔断；401 与这种 403 额外写 `auth_invalid` 信号并在 `/api/accounts` 显示；不进入回退链（换账户也会失败的错误除外：413 可回退到更大 context 的账户） |
 
 识别函数 `Oasis_signals.classify_error : status:int option -> body:string -> error_class` 为纯函数、可单测。
 
@@ -237,13 +242,15 @@ daily 语义）是**每 30s 烧一次请求并污染时延 EMA**。0.3 区分三
 | `POST /v1/chat/completions` | OpenAI 兼容（流式 SSE / 非流式）；头 `X-Oasis-Category` `X-Oasis-Goal` `X-Oasis-Mode` `X-Oasis-Session`；可选 `X-Oasis-Source`（来源标签，默认 `api`）、`X-Oasis-Client-Ref`（原样回显在 `task_started`，供控制台关联自己发起的请求）、`X-Oasis-Agent`（指定 agent）、`X-Oasis-Committee`（委员会成员，§2.4）、`X-Oasis-Thread`（续接对话，§2.6.2；响应头回传本轮所属的对话 id） |
 | `GET /v1/models` | KB 模型列表 |
 | `POST /mcp` | MCP（JSON-RPC 2.0 / Streamable HTTP 简化）11 工具：oasis_ask、oasis_agent_task、oasis_task_status、oasis_status、oasis_decisions、oasis_send_message、oasis_check_inbox、oasis_ask_user、oasis_activity、oasis_agents、oasis_models |
-| `GET /api/*` | accounts（状态）、decisions（决策）、ledger（账本）、reload（热重载）、inbox（未读）、agents（盘点 + 已配置 agent 的信号）、activity（时间线）、requests（审计）、**feed**（最近任务摘要）、**feed/task?id=**（单任务：路由说明 + 时间线 + 回答）、**threads?limit=**（最近对话摘要）、**thread?id=**（整段对话：各轮问答 + agent 会话 id；不存在 404）、**workspace?id=**（任务工作目录里的文件列表）、**workspace/file?id=&path=**（读一个产出文件，文本最多 512 KB）；`POST /api/thread/delete {"id"|"task", "files"}`（删除对话或无对话的任务，§2.6.5）、**alerts**（需要处理的问题 + 可复制的修复命令）；配置向导（§2.8）：`GET /api/setup/scan`、`POST /api/setup/verify`、`POST /api/setup/apply` |
+| `GET /api/*` | accounts（状态）、decisions（决策）、ledger（账本）、reload（热重载）、inbox（未读）、agents（盘点 + 已配置 agent 的信号）、activity（本机 Claude、Cursor、Codex、DeepSeek Harness、ZCode、WorkBuddy、Grok 的会话，加上 Oasis 自己派出的任务）、requests（审计）、**feed**（最近任务摘要）、**feed/task?id=**（单任务：路由说明 + 时间线 + 回答）、**threads?limit=**（最近对话摘要）、**thread?id=**（整段对话：各轮问答 + agent 会话 id；不存在 404）、**workspace?id=**（任务工作目录里的文件列表）、**workspace/file?id=&path=**（读一个产出文件，文本最多 512 KB）；`POST /api/thread/delete {"id"|"task", "files"}`（删除对话或无对话的任务，§2.6.5）、**alerts**（需要处理的问题 + 可复制的修复命令）；配置向导（§2.8）：`GET /api/setup/scan`、`POST /api/setup/verify`、`POST /api/setup/apply` |
 | `WS /ws` | 实时推送：decision + 事件流（task_started → routed → attempt_started → attempt_finished → **[0.3 新增]** handoff → task_done，以及 agent 的 `agent_step`） |
 | `GET /` | 控制台（§2.6）：工作台（任务列表 / 任务详情 / 需要你处理 + 资源）与诊断页（账户明细、原始决策、过程图、agent 盘点、会话活动、收件箱） |
 
 **[0.3 新增]** 所有非 `GET /` 与非静态资源的接口受 §5 的鉴权约束。
 
 ### 2.6 控制台与任务流
+
+工作台任务列表同时列出本机 agent 自己正在做的会话（Claude、Cursor、Codex、DeepSeek Harness、ZCode、WorkBuddy、Grok）。点开可以看项目目录和最近正文；在下方继续会指定对应 agent、原来的目录，并用 `X-Oasis-Resume` 续接那个会话。Oasis 不向这些进程发停止信号。
 
 `Oasis_feed` 在 `broadcast_event` 处把每个事件折叠进按 `request_id` 的任务记录（内存，保留最近 200 条，
 重启清空）：标题（最后一条 user 消息，折叠空白）、来源（api / mcp / dashboard）、执行者、状态、时间线、

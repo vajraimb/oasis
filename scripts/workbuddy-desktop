@@ -1,0 +1,215 @@
+#!/usr/bin/python3
+"""Ask the signed-in WorkBuddy desktop for one answer.
+
+A standalone codebuddy process cannot decrypt the desktop session. The
+running app keeps a local broker; this sends the prompt through that
+broker and prints the answer.
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import socket
+import sys
+
+
+def fail(message):
+    sys.stderr.write(message.rstrip() + "\n")
+    raise SystemExit(1)
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def proof(ticket, endpoint, role, client_nonce, server_nonce):
+    prefix = "wbipc-s" if role == "server" else "wbipc-c"
+    parts = [prefix, "1", endpoint, client_nonce, server_nonce]
+    msg = b""
+    for part in parts:
+        encoded = part.encode()
+        msg += len(encoded).to_bytes(4, "big") + encoded
+    digest = hmac.new(ticket.encode(), msg, hashlib.sha256).digest()
+    return b64url(digest)
+
+
+class Broker:
+    def __init__(self, endpoint, ticket):
+        self.endpoint = endpoint
+        self.ticket = ticket
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(60)
+        try:
+            self.sock.connect(endpoint)
+        except OSError:
+            fail("WorkBuddy 桌面版没有在运行，已登录的账号现在调不到")
+        self.buf = b""
+        client_nonce = b64url(secrets.token_bytes(16))
+        ticket_id = hashlib.sha256(ticket.encode()).hexdigest()[:16]
+        self.send(
+            {
+                "type": "session_hello",
+                "protocol_min": 1,
+                "protocol_max": 1,
+                "client_nonce": client_nonce,
+                "ticket_id": ticket_id,
+                "client": {"kind": "oasis", "id": "local"},
+            }
+        )
+        challenge = self.recv()
+        if challenge.get("type") != "session_challenge":
+            fail("WorkBuddy 桌面通道拒绝了这次调用")
+        server_nonce = challenge.get("server_nonce") or ""
+        expected = proof(ticket, endpoint, "server", client_nonce, server_nonce)
+        if not hmac.compare_digest(expected, challenge.get("server_proof") or ""):
+            fail("WorkBuddy 桌面通道拒绝了这次调用")
+        self.send(
+            {
+                "type": "session_prove",
+                "client_proof": proof(ticket, endpoint, "client", client_nonce, server_nonce),
+            }
+        )
+        ack = self.recv()
+        if ack.get("type") != "session_hello_ack":
+            fail("WorkBuddy 桌面通道拒绝了这次调用")
+
+    def send(self, obj):
+        self.sock.sendall(json.dumps(obj, separators=(",", ":")).encode() + b"\n")
+
+    def recv(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(1 << 20)
+            if not chunk:
+                fail("WorkBuddy 桌面通道中途断开")
+            self.buf += chunk
+        line, _, self.buf = self.buf.partition(b"\n")
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            fail("WorkBuddy 桌面通道返回了无法识别的内容")
+
+    def close(self):
+        self.sock.close()
+
+
+def text_of(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(text_of(item) for item in value)
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        if isinstance(value.get("content"), (str, list, dict)):
+            return text_of(value["content"])
+    return ""
+
+
+def answer_from_sse(raw):
+    deltas = []
+    finals = []
+    for line in raw.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        for choice in event.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                deltas.append(text_of(delta.get("content")))
+            message = choice.get("message")
+            if isinstance(message, dict):
+                finals.append(text_of(message.get("content")))
+    if any(deltas):
+        return "".join(deltas).strip()
+    if finals:
+        return finals[-1].strip()
+    return ""
+
+
+def short_error(raw):
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.strip()[:180]
+    if isinstance(obj, dict):
+        for key in ("msg", "error_msg", "message"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:180]
+    return raw.strip()[:180]
+
+
+def main():
+    prompt = " ".join(sys.argv[1:]).strip()
+    if not prompt:
+        fail("没有要发给 WorkBuddy 的内容")
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    path = os.path.join(home, ".workbuddy", "wbipc", "endpoint.json")
+    try:
+        meta = json.loads(open(path, encoding="utf-8").read())
+    except OSError:
+        fail("WorkBuddy 桌面版没有在运行，已登录的账号现在调不到")
+    except json.JSONDecodeError:
+        fail("WorkBuddy 桌面通道的地址文件坏了")
+    endpoint = meta.get("endpoint") if isinstance(meta, dict) else None
+    ticket = meta.get("ticket") if isinstance(meta, dict) else None
+    if not isinstance(endpoint, str) or not isinstance(ticket, str) or not endpoint or not ticket:
+        fail("WorkBuddy 桌面通道的地址文件坏了")
+    broker = Broker(endpoint, ticket)
+    try:
+        broker.send({"jsonrpc": "2.0", "id": 1, "method": "broker/GetPipe", "params": {"pipe": "wb.request"}})
+        opened = broker.recv()
+        if "error" in opened:
+            fail("WorkBuddy 桌面通道没有开放对话")
+        channel = (opened.get("result") or {}).get("channel")
+        if not isinstance(channel, str) or not channel:
+            fail("WorkBuddy 桌面通道没有开放对话")
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        }
+        broker.send(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": channel + "/http.fetch",
+                "mode": "call",
+                "params": {
+                    "method": "POST",
+                    "path": "/v2/chat/completions",
+                    "headers": {"content-type": "application/json", "accept": "text/event-stream"},
+                    "body_b64": base64.b64encode(json.dumps(body, ensure_ascii=False).encode()).decode(),
+                },
+            }
+        )
+        result = broker.recv()
+    finally:
+        broker.close()
+    if "error" in result:
+        message = result["error"].get("message") if isinstance(result["error"], dict) else ""
+        fail(message.strip()[:180] if isinstance(message, str) and message.strip() else "WorkBuddy 桌面通道没有返回回答")
+    payload = result.get("result") or {}
+    status = payload.get("status")
+    raw = base64.b64decode(payload.get("body_b64") or "").decode("utf-8", "replace")
+    if status != 200:
+        fail("WorkBuddy 拒绝了这次请求：" + (short_error(raw) or str(status)))
+    answer = answer_from_sse(raw)
+    if not answer:
+        fail("WorkBuddy 没有返回文字")
+    sys.stdout.write(answer + "\n")
+
+
+if __name__ == "__main__":
+    main()

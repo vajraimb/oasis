@@ -172,7 +172,7 @@ All headers are optional. Without them, Oasis decides from the content.
 | `X-Oasis-Agent` | run on a specific agent |
 | `X-Oasis-Committee` | comma-separated accounts that answer together |
 | `X-Oasis-Thread` | continue a conversation |
-| `X-Oasis-Timeout` | time limit in seconds; by default the task runs until it finishes or you stop it |
+| `X-Oasis-Timeout` | seconds. A normal request runs until it finishes or you stop it. For a committee this is each seat's limit, 180 seconds when omitted; a seat that misses it is dropped and the others are still summarized |
 
 Setting `model` to `auto`, `oasis` or leaving it empty lets Oasis route. A model name from your config pins that model.
 

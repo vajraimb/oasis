@@ -80,7 +80,8 @@ let oasis_task_summaries = fun (state : state) ->
         | Some 200 when not (String.is_empty attempt.Oasis_router.model) ->
             Some
               {
-                Oasis_activity.project = "oasis-agent-task";
+                Oasis_activity.agent = "oasis";
+                project = "oasis-agent-task";
                 session_id = "oasis-" ^ Int.to_string attempt.Oasis_router.latency_ms;
                 last_ts = 0.0;
                 turns = 1;
@@ -88,6 +89,8 @@ let oasis_task_summaries = fun (state : state) ->
                 last_excerpt =
                   "agent " ^ attempt.Oasis_router.account ^ " 完成任务 ("
                   ^ Int.to_string attempt.Oasis_router.latency_ms ^ "ms)";
+                running = false;
+                resumable = true;
               }
         | _ -> None
       )
@@ -96,7 +99,11 @@ let oasis_task_summaries = fun (state : state) ->
 
 let handle_list_activity = fun (state : state) (ctx : Trail.ctx) ->
   let home = discover_home state in
-  let limit = 20 in
+  let limit =
+    match query_param ctx "limit" |> Option.and_then ~fn:Int.from_string_opt with
+    | Some n when n > 0 && n <= 60 -> n
+    | _ -> 20
+  in
   let query = None in
   let summaries =
     Oasis_activity.scan ~home ~limit @ oasis_task_summaries state
@@ -113,6 +120,25 @@ let handle_list_activity = fun (state : state) (ctx : Trail.ctx) ->
     ctx
     (Json.obj
       [ ("sessions", Json.array (List.map summaries ~fn:Oasis_activity.summary_json)) ])
+
+let handle_activity_session = fun (state : state) (ctx : Trail.ctx) ->
+  let home = discover_home state in
+  match (query_param ctx "agent", query_param ctx "id") with
+  | (Some agent, Some id) -> (
+      match Oasis_activity.observe ~home ~agent ~session_id:id with
+      | Some o -> Trail.json ctx (Oasis_activity.observation_json o)
+      | None ->
+          Trail.json
+            ~status:Net.Http.Status.NotFound
+            ctx
+            (Json.obj [ ("error", Json.string "没有这段会话") ])
+    )
+  | _ ->
+      Trail.json
+        ~status:Net.Http.Status.BadRequest
+        ctx
+        (Json.obj [ ("error", Json.string "缺少 agent 或 id") ])
+
 let mcp_tool_models = fun (state : state) ->
   let config = Sync.Atomic.get state.config in
   let model_lines =
@@ -157,8 +183,10 @@ let mcp_tool_activity = fun (state : state) (params : Json.t) ->
   else
     Ok
       (List.map summaries ~fn:(fun s ->
-        "[" ^ s.Oasis_activity.project ^ "] turns=" ^ Int.to_string s.Oasis_activity.turns
+        "[" ^ s.Oasis_activity.agent ^ "] " ^ s.Oasis_activity.project
+        ^ " turns=" ^ Int.to_string s.Oasis_activity.turns
         ^ " tools=" ^ Int.to_string s.Oasis_activity.tools
+        ^ (if s.Oasis_activity.running then " 进行中" else "")
         ^ "\n   最新: " ^ s.Oasis_activity.last_excerpt)
       |> String.concat "\n")
 let mcp_tool_ask = fun (state : state) (params : Json.t) ->

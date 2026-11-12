@@ -454,6 +454,15 @@ window.fetch = async (url, opts = {}) => {
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const CAT = { general: '通用', coding: '编程', research: '联网检索', writing: '写作', analysis: '分析', reasoning: '推理' };
+const EXT = {
+  claude: { name: 'Claude', agent: 'claude_code' },
+  cursor: { name: 'Cursor', agent: 'cursor_agent' },
+  codex: { name: 'Codex', agent: 'codex_cli' },
+  deepseek: { name: 'DeepSeek', agent: 'deepseek_harness' },
+  zcode: { name: 'ZCode', agent: 'zcode' },
+  workbuddy: { name: 'WorkBuddy', agent: 'workbuddy' },
+  grok: { name: 'Grok', agent: 'grok_cli' },
+};
 const SRC = { api: 'API', mcp: 'MCP', dashboard: '控制台' };
 function fmtDur(ms) {
   if (ms == null) return '';
@@ -484,7 +493,7 @@ document.querySelectorAll('.tab').forEach(b => b.onclick = () => {
 /* ---------- state ---------- */
 const S = { routeFold: localStorage.getItem('oasis_route_fold') === '1', tasks: [], sel: null, detail: null, filter: 'all', dirtyList: true, dirtyDetail: false,
             localAnswers: {}, refs: {}, pendingRef: null, detailTab: 'trace', openTools: new Set(), openText: new Set(),
-            threads: [], selKey: null, selThread: null, thread: null };
+            threads: [], selKey: null, selThread: null, thread: null, external: [], ext: null };
 
 /* ---------- command bar ---------- */
 let mode = '';
@@ -629,6 +638,24 @@ function threadRow(id) { return rowsAll().find(r => r.thread === id); }
 async function followUp() {
   const box = $('follow-in');
   const text = box.value.trim();
+  if (S.ext) {
+    const s = S.ext;
+    const meta = EXT[s.agent] || {};
+    if (!text) { box.focus(); return; }
+    if (!meta.agent) { toast('这个 agent 还没有接到 Oasis'); return; }
+    const dir = (s.project || '').startsWith('/') ? s.project : '';
+    if (!dir) { toast('没有项目目录，没法续接'); return; }
+    if (s.running) { toast('它还在自己那边跑，先看进度'); return; }
+    if (s.resumable === false) { toast('这条会话是桌面端开的，请在它自己的窗口里回复'); return; }
+    box.value = '';
+    await send(text, {
+      'X-Oasis-Mode': 'agent',
+      'X-Oasis-Agent': meta.agent,
+      'X-Oasis-Workdir': dir,
+      'X-Oasis-Resume': s.session_id,
+    }, true);
+    return;
+  }
   const id = S.selThread;
   if (!text || !id) { box.focus(); return; }
   const row = threadRow(id);
@@ -649,7 +676,7 @@ async function send(text, extra, stream) {
     'X-Oasis-Client-Ref': ref
   }, extra);
   const wd = ($('workdir').value || '').trim();
-  if (wd) { headers['X-Oasis-Workdir'] = wd; localStorage.setItem('oasis_workdir', wd); }
+  if (wd && !headers['X-Oasis-Workdir']) { headers['X-Oasis-Workdir'] = wd; localStorage.setItem('oasis_workdir', wd); }
   try {
     const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify({ model: null, messages: [{ role: 'user', content: text }], stream }) });
     if (!res.ok || !res.body) {
@@ -695,10 +722,20 @@ document.querySelectorAll('#filters button').forEach(b => b.onclick = () => {
 });
 async function loadList() {
   try {
-    const [j, th] = await Promise.all([fetch('/api/feed?limit=150').then(r => r.json()), fetch('/api/threads?limit=80').then(r => r.json())]);
+    const [j, th, act] = await Promise.all([
+      fetch('/api/feed?limit=150').then(r => r.json()),
+      fetch('/api/threads?limit=80').then(r => r.json()),
+      fetch('/api/activity?limit=40').then(r => r.json()),
+    ]);
     S.tasks = j.tasks || [];
     S.threads = th.threads || [];
+    S.external = (act.sessions || []).filter(s => s.agent && s.agent !== 'oasis' && s.session_id);
+    if (S.ext) {
+      const fresh = S.external.find(s => s.agent === S.ext.agent && s.session_id === S.ext.session_id);
+      if (fresh) S.ext = fresh;
+    }
     renderList();
+    if (S.ext) renderDetail(false);
   } catch (e) {}
 }
 /* one row per conversation: live turns from the feed, older conversations from the thread store */
@@ -715,11 +752,20 @@ function rowsAll() {
   });
   S.threads.forEach(th => { if (!by.has(th.id)) rows.push({ key: th.id, thread: th.id, last: null, tasks: [], title: th.title, n: th.turns,
     status: th.status, mode: th.mode, executor: th.executor, at: th.updated_ms, dur: null, source: '', hist: true }); });
+  (S.external || []).forEach(s => {
+    const meta = EXT[s.agent] || { name: s.agent };
+    const base = (s.project || '').split('/').filter(Boolean).pop() || s.project || '';
+    rows.push({ key: 'ext:' + s.agent + ':' + s.session_id, external: s, thread: '', last: null, tasks: [],
+      title: (s.last_excerpt || '').trim() || base || '外部会话', n: s.turns || 0,
+      status: s.running ? 'running' : 'external', mode: 'external', executor: meta.name,
+      at: Math.round((s.last_ts || 0) * 1000), dur: null, source: '外部' });
+  });
   rows.sort((a, b) => b.at - a.at);
   return rows;
 }
 function statusGlyph(st) {
   if (st === 'running') return '<span class="spin"></span>';
+  if (st === 'external') return '◦';
   return st === 'ok' ? '✓' : st === 'cancelled' ? '■' : st === 'interrupted' ? '⏸' : '✗';
 }
 function visibleTasks() {
@@ -728,14 +774,15 @@ function visibleTasks() {
 function renderList() {
   const box = $('tasks');
   const list = visibleTasks();
-  if (!list.length) { box.innerHTML = '<div class="empty">' + (S.tasks.length || S.threads.length ? '没有符合条件的任务' : '还没有任务<br><span style="font-size:12px">从上方输入，或通过 API / MCP 调用网关</span>') + '</div>'; return; }
+  if (!list.length) { box.innerHTML = '<div class="empty">' + (S.tasks.length || S.threads.length || (S.external || []).length ? '没有符合条件的任务' : '还没有任务<br><span style="font-size:12px">从上方输入，或通过 API / MCP 调用网关</span>') + '</div>'; return; }
   box.innerHTML = list.map(r => {
-    const m = r.mode === 'agent' ? '<span class="tag agent">Agent</span>' : r.mode === 'committee' ? '<span class="tag chat">委员会</span>' : (r.mode ? '<span class="tag chat">问答</span>' : '');
+    const m = r.mode === 'external' ? '<span class="tag agent">' + esc(r.executor) + '</span>' : r.mode === 'agent' ? '<span class="tag agent">Agent</span>' : r.mode === 'committee' ? '<span class="tag chat">委员会</span>' : (r.mode ? '<span class="tag chat">问答</span>' : '');
+    const where = r.external ? ((r.external.project || '').split('/').filter(Boolean).pop() || '') : (r.executor || (r.status === 'running' ? '路由中' : '无执行者'));
     return '<div class="task' + (r.key === S.selKey ? ' sel' : '') + '" data-k="' + esc(r.key) + '">' +
       '<div class="st ' + r.status + '">' + statusGlyph(r.status) + '</div>' +
       '<div class="t"><span class="tt">' + (esc(r.title) || '<span class="dim">（无标题）</span>') + '</span>' +
-      '<button type="button" class="xdel" data-k="' + esc(r.key) + '" title="删除这条任务，保留产出文件">×</button></div>' +
-      '<div class="m">' + m + (r.n > 1 ? '<span class="nturn">' + r.n + ' 轮</span>' : '') + '<span>' + esc(r.executor || (r.status === 'running' ? '路由中' : '无执行者')) + '</span><span>' + fmtDur(r.dur) + '</span>' +
+      (r.external ? '' : '<button type="button" class="xdel" data-k="' + esc(r.key) + '" title="删除这条任务，保留产出文件">×</button>') + '</div>' +
+      '<div class="m">' + m + (r.n > 1 ? '<span class="nturn">' + r.n + ' 轮</span>' : '') + '<span>' + esc(where) + '</span><span>' + fmtDur(r.dur) + '</span>' +
       '<span>' + (r.hist ? '历史' : esc(SRC[r.source] || r.source)) + '</span><span style="margin-left:auto">' + ago(r.at) + '</span></div></div>';
   }).join('');
   box.querySelectorAll('.task').forEach(el => el.onclick = () => select(el.dataset.k));
@@ -745,6 +792,21 @@ function renderList() {
 function select(key) {
   const r = rowsAll().find(x => x.key === key);
   if (!r) return;
+  if (r.external) {
+    if (S.selKey !== key) { S.openTools.clear(); S.openText.clear(); S.thread = null; S.detail = null; S.extView = null; }
+    S.selKey = key;
+    S.selThread = null;
+    S.sel = null;
+    S.ext = r.external;
+    renderList();
+    loadExternal(true);
+    if (isPhone()) {
+      $('work').classList.add('list-off');
+      $('list-toggle').classList.remove('on');
+    }
+    return;
+  }
+  S.ext = null;
   if (S.selKey !== key) { S.openTools.clear(); S.openText.clear(); S.thread = null; }
   S.selKey = key;
   S.selThread = r.thread || null;
@@ -827,7 +889,7 @@ function homeEmpty() {
   return '<div class="empty" style="margin:auto"><div class="desk-hint">选择左侧任务查看路由说明和执行过程<br><span class="dim" style="font-size:12px">快捷键：/ 输入 · j k 切换任务 · [ 任务栏 · \\ 侧栏</span></div><div class="phone-hint">在下方输入，开始一个任务<br><span class="dim">点「任务栏」看以前的对话</span></div></div>';
 }
 function clearSel(msg) {
-  S.sel = null; S.selKey = null; S.selThread = null; S.detail = null; S.thread = null; S.ws = null; S.wsFile = null;
+  S.sel = null; S.selKey = null; S.selThread = null; S.detail = null; S.thread = null; S.ws = null; S.wsFile = null; S.ext = null; S.extView = null;
   $('dbody').innerHTML = msg ? '<div class="empty" style="margin:auto">' + esc(msg) + '</div>' : homeEmpty();
   syncFollow();
 }
@@ -905,6 +967,20 @@ const REASON = { unknown_account: '未在配置中', disabled: '已停用', mode
 
 const ST = { running: '进行中', ok: '完成', failed: '失败', cancelled: '已停止', interrupted: '已中断' };
 function syncFollow() {
+  if (S.ext) {
+    const s = S.ext;
+    const meta = EXT[s.agent] || { name: s.agent, agent: '' };
+    const dir = (s.project || '').startsWith('/');
+    const desktop = s.resumable === false;
+    $('followbar').classList.add('on');
+    $('follow-go').disabled = !!s.running || desktop || !meta.agent || !dir;
+    $('follow-hint').textContent = s.running
+      ? meta.name + ' 还在自己那边跑。这里看进度；它停下来之后，可以在 Oasis 里接着做'
+      : desktop
+      ? '这条会话是 ' + meta.name + ' 桌面端开的，回复要在它自己的窗口里输入'
+      : '接着交给 ' + meta.name + '：在原来的目录里续接它的会话';
+    return;
+  }
   const id = S.selThread;
   $('followbar').classList.toggle('on', !!id);
   if (!id) return;
@@ -940,7 +1016,50 @@ function renderConversation(d) {
       '<div class="a">' + (answer ? mdHtml(answer) : '<span class="dim">' + (x.status === 'running' ? '进行中…' : '没有输出') + '</span>') + '</div></div>';
   }).join('');
 }
+async function loadExternal(scrollEnd) {
+  const s = S.ext;
+  if (!s) return;
+  try {
+    const r = await fetch('/api/activity/session?agent=' + encodeURIComponent(s.agent) + '&id=' + encodeURIComponent(s.session_id));
+    const j = await r.json();
+    if (S.ext && S.ext.agent === s.agent && S.ext.session_id === s.session_id) {
+      S.extView = r.ok ? j : { error: j.error || '读不到这段会话' };
+      renderExternal(scrollEnd);
+    }
+  } catch (e) {
+    if (S.ext && S.ext.session_id === s.session_id) { S.extView = { error: '读不到这段会话' }; renderExternal(scrollEnd); }
+  }
+}
+function renderExternal(scrollEnd) {
+  const s = S.ext;
+  if (!s) return;
+  syncFollow();
+  const box = $('dbody');
+  const prev = box.querySelector('.scroll');
+  const keepTop = prev ? prev.scrollTop : 0;
+  const meta = EXT[s.agent] || { name: s.agent };
+  const view = S.extView;
+  const text = view && view.text ? view.text : (s.last_excerpt || '');
+  const body = !view ? '<div class="empty">读取会话…</div>' :
+    view.error ? '<div class="empty">' + esc(view.error) + '</div>' :
+    text ? '<pre style="white-space:pre-wrap;font-size:13px;line-height:1.65;margin:0">' + esc(text) + '</pre>' +
+      (view.truncated ? '<div class="dim" style="margin-top:8px">只显示末尾一段</div>' : '') :
+    '<div class="empty">这段会话还没有可读的正文。项目和状态在上面。</div>';
+  box.innerHTML =
+    '<div class="dhead"><div class="dtitle">' + (esc((s.last_excerpt || '').trim()) || esc((s.project || '').split('/').filter(Boolean).pop() || '外部会话')) + '</div>' +
+    '<div class="chips"><span class="pill ' + (s.running ? 'running' : 'ok') + '">' + (s.running ? '进行中' : '最近') + '</span>' +
+    '<span class="tag agent">' + esc(meta.name) + '</span>' +
+    '<span class="mono dim" style="cursor:pointer" id="ext-path" title="复制项目目录">' + esc(s.project || '') + '</span>' +
+    '<button class="sbtn" id="ext-refresh" type="button">刷新进度</button></div>' +
+    '<div class="route"><span class="k">来源</span><div>这是 ' + esc(meta.name) + ' 自己的会话。Oasis 在这里看进度；下面的输入会用同一个会话接着做，不会停掉它现在的进程。</div></div></div>' +
+    '<div class="scroll">' + body + '</div>';
+  if ($('ext-path')) $('ext-path').onclick = () => copy(s.project || '');
+  if ($('ext-refresh')) $('ext-refresh').onclick = () => loadExternal(false);
+  const sc = box.querySelector('.scroll');
+  if (sc) sc.scrollTop = scrollEnd ? sc.scrollHeight : keepTop;
+}
 function renderDetail(scrollEnd) {
+  if (S.ext) { renderExternal(scrollEnd); return; }
   const d = S.detail;
   const box = $('dbody');
   syncFollow();
@@ -1310,7 +1429,7 @@ function connectWs() {
       if (j.event === 'task_started' && j.data && j.data.client_ref) {
         S.refs[j.request_id] = j.data.client_ref;
         if (j.data.client_ref === S.pendingRef) {
-          S.pendingRef = null; S.sel = j.request_id; S.detailTab = S.detailTab === 'conv' && j.data.turn > 1 ? 'conv' : 'trace';
+          S.pendingRef = null; S.ext = null; S.extView = null; S.sel = j.request_id; S.detailTab = S.detailTab === 'conv' && j.data.turn > 1 ? 'conv' : 'trace';
           S.selThread = j.data.thread || null; S.selKey = j.data.thread || j.request_id;
           S.openTools.clear(); S.openText.clear(); S.dirtyDetail = true;
         }
@@ -1336,6 +1455,11 @@ setInterval(() => {
 setInterval(() => {
   if (S.tasks.some(t => t.status === 'running')) { renderList(); if (S.detail && S.detail.status === 'running') S.dirtyDetail = true; }
 }, 1000);
+setInterval(() => {
+  const work = $('view-work');
+  if (work && work.style.display !== 'none' && !document.hidden) S.dirtyList = true;
+  if (S.ext && S.ext.running) loadExternal(false);
+}, 5000);
 
 /* ---------- right rail ---------- */
 function setRail(on) {
@@ -1476,8 +1600,16 @@ async function refreshAgentsDiag() {
 }
 async function refreshActivity() {
   const data = await (await fetch('/api/activity')).json();
-  const rows = (data.sessions || []).map(s => '<div style="border-bottom:1px solid var(--line);padding:4px 0"><div>' + esc(s.project) +
-    ' <span class="tag">' + s.turns + ' 轮</span>' + (s.tools ? ' <span class="tag">' + s.tools + ' 工具</span>' : '') + '</div><div class="muted">' + esc(s.last_excerpt || '') + '</div></div>');
+  const nameOf = { claude: 'Claude', cursor: 'Cursor', codex: 'Codex', deepseek: 'DeepSeek', zcode: 'ZCode', workbuddy: 'WorkBuddy', grok: 'Grok', oasis: 'Oasis' };
+  const rows = (data.sessions || []).map(s => {
+    const name = nameOf[s.agent] || s.agent || '';
+    return '<div style="border-bottom:1px solid var(--line);padding:4px 0"><div>' +
+      (name ? '<span class="tag">' + esc(name) + '</span> ' : '') +
+      (s.running ? '<span class="pill running">进行中</span> ' : '') +
+      esc(s.project) +
+      ' <span class="tag">' + s.turns + ' 轮</span>' + (s.tools ? ' <span class="tag">' + s.tools + ' 工具</span>' : '') +
+      '</div><div class="muted">' + esc(s.last_excerpt || '') + '</div></div>';
+  });
   $('activity-box').innerHTML = rows.length ? rows.join('') : '<span class="dim">暂无活动记录</span>';
 }
 async function refreshInbox() {

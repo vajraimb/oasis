@@ -153,12 +153,21 @@ let error_text = fun (err : string) ->
   else if has "empty_answer_reasoning_exhausted" then
     "思考用完了 max_tokens 仍没给出回答（推理模型常见），已换下一个候选"
   else if has "empty_answer" then "正常结束但没有输出任何回答，已换下一个候选"
+  else if has "cannot find module" && has "dist/codebuddy" then
+    "WorkBuddy 更新后，命令行要加载的程序包不在原来的位置"
+  else if has "use /login" || has "authentication required" then
+    "WorkBuddy 桌面版的登录是加密的，单独拉起的命令行解不开。先打开 WorkBuddy 桌面应用，Oasis 会走它已经登好的账号"
+  else if has "one-shot runner does not compose" then
+    "这条会话是 DeepSeek 桌面端开的，命令行接不进去。请在 DeepSeek 窗口里回复"
   else if has "exited with code" then
     "进程异常退出（" ^ err ^ "）——多半是 CLI 未登录、参数不兼容或自身报错"
+  else if has "agent idle" then "进程还在，但持续没有任何输出，已停止"
   else if has "timeout" then "超时未完成"
+  else if has "quota" || has "insufficient" || has "balance" || has "余额" || has "credit" then
+    "被限流或额度不足"
   else if has "401" || has "403" || has "auth" || has "invalid_api_key" || has "unauthorized" then
     "认证失败：key 失效或需要重新登录"
-  else if has "429" || has "rate" || has "quota" || has "insufficient" then "被限流或额度不足"
+  else if has "429" || has "rate" then "被限流或额度不足"
   else if has "dns" || has "connect" || has "resolve" || has "refused" || has "unreachable" then
     "连接失败：网络或 DNS 问题"
   else if has "ended_early" || has "ended early" then "输出流中途断开"

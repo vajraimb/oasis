@@ -40,9 +40,10 @@ let threads_file = fun (state : state) -> (Sync.Atomic.get state.config).Oasis_c
 
 (* ---------- cancellation ---------- *)
 
-(** [Task_cancel] reasons: "user" (stop button / API) or "timeout:<secs>"
-    (deadline the caller asked for via X-Oasis-Timeout). Oasis itself never
-    imposes a task deadline. *)
+(** [Task_cancel] reasons: "user" (stop button / API), "timeout:<secs>"
+    (whole-task deadline from X-Oasis-Timeout), or "seat:<secs>" (one
+    committee seat hit its limit; the rest of the committee continues).
+    A normal chat has no deadline unless the caller sets one. *)
 let watch_task = fun (state : state) ?pid ~request_id () ->
   if not (String.is_empty request_id) then
     let pid = match pid with Some p -> p | None -> self () in

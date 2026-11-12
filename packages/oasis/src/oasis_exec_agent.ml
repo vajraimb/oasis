@@ -233,7 +233,7 @@ let place_agent = fun (state : state) ~request_id ?workspace ?requested (agent :
                 ]);
           Ok agent)
 
-let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir (state : state) (ctx : Trail.ctx) (body : Json.t) ~(category : string) ~(stream_requested : bool) ~(request_id : string) ->
+let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume (state : state) (ctx : Trail.ctx) (body : Json.t) ~(category : string) ~(stream_requested : bool) ~(request_id : string) ->
   audit_log state ~path:"/agent-path-enter" ~category ~goal:"-" ~stream_:stream_requested ~request_id ();
   let config = Sync.Atomic.get state.config in
   let model =
@@ -246,12 +246,21 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir (state :
   (* a follow-up resumes the agent's own CLI session when it has one; any
      other agent gets the conversation replayed in its prompt *)
   let prompt_for nm (agent : Oasis_agent.agent) prompt0 =
+    let from_header =
+      match resume with
+      | Some sid when not (String.is_empty sid) -> Oasis_agent.with_resume agent ~session:sid
+      | _ -> None
+    in
     let resumed =
-      match thread with
-      | None -> None
-      | Some th ->
-          Oasis_thread.session_of th ~agent:nm
-          |> Option.and_then ~fn:(fun sid -> Oasis_agent.with_resume agent ~session:sid)
+      match from_header with
+      | Some _ as hit -> hit
+      | None -> (
+          match thread with
+          | None -> None
+          | Some th ->
+              Oasis_thread.session_of th ~agent:nm
+              |> Option.and_then ~fn:(fun sid -> Oasis_agent.with_resume agent ~session:sid)
+        )
     in
     let agent, prompt =
       match resumed with
@@ -561,9 +570,9 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir (state :
                 then
                   loop ()
             | exception Receive_timeout ->
-                (* heartbeat: agent may work silently for minutes (tool
-                   runs); it runs until it exits or the task is cancelled.
-                   A failed write only detaches the page. *)
+                (* heartbeat: keeps the page open while the agent works.
+                   A process that writes nothing for its silence limit is
+                   failed by the drain. A failed write only detaches the page. *)
                 write_client
                   "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n";
                 loop ()

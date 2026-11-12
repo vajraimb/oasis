@@ -172,7 +172,7 @@ curl -N http://127.0.0.1:9899/v1/chat/completions \
 | `X-Oasis-Agent` | 指定某个 agent 执行 |
 | `X-Oasis-Committee` | 一起作答的账户，逗号分隔 |
 | `X-Oasis-Thread` | 续接对话 |
-| `X-Oasis-Timeout` | 时限（秒）；不给就一直执行到完成或被你停止 |
+| `X-Oasis-Timeout` | 时限（秒）。普通请求不给就一直跑到完成或被你停止。委员会里这是每一席的时限，不给则 180 秒；到点的席记失败，其余照常汇总 |
 
 `model` 填 `auto`、`oasis` 或留空，由 Oasis 路由；填配置里的模型名，就固定用那个模型。
 

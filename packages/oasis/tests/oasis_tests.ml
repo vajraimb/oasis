@@ -1661,6 +1661,49 @@ let mk_agent = fun ?(tier = 4) ?(command = "/bin/sh") ?(args = [ "{prompt}" ]) ?
 
 let fix = fun name -> Agent.absolute ("./packages/oasis/tests/fixtures/" ^ name)
 
+let test_codex_resume_args = fun _ctx ->
+  let agent =
+    mk_agent
+      ~command:"/Applications/ChatGPT.app/Contents/Resources/codex"
+      ~args:[ "exec"; "--skip-git-repo-check"; "{prompt}" ]
+      "codex_cli"
+  in
+  match Agent.with_resume agent ~session:"abc" with
+  | None -> Error "codex has no resume"
+  | Some a ->
+      let joined = String.concat " " a.Agent.args_template in
+      Test.assert_equal ~expected:true ~actual:(String.contains joined "exec resume abc");
+      Test.assert_equal ~expected:true ~actual:(String.contains joined "--skip-git-repo-check");
+      Test.assert_equal ~expected:true ~actual:(String.contains joined "{prompt}");
+      Ok ()
+
+let test_dsh_turn_closed = fun _ctx ->
+  let open_turn = "{\"type\":\"turn/start\"}\n{\"type\":\"tool/call\"}\n" in
+  let closed = open_turn ^ "{\"type\":\"turn/end\"}\n" in
+  Test.assert_equal ~expected:false ~actual:(Activity.dsh_turn_closed open_turn);
+  Test.assert_equal ~expected:true ~actual:(Activity.dsh_turn_closed closed);
+  Test.assert_equal ~expected:false ~actual:(Activity.dsh_turn_closed "");
+  Test.assert_equal
+    ~expected:true
+    ~actual:(Activity.dsh_preset_locked "{\"type\":\"session\",\"agentPreset\":\"standard\"}");
+  Test.assert_equal ~expected:false ~actual:(Activity.dsh_preset_locked "{\"type\":\"session\"}");
+  Ok ()
+
+let test_dsh_resume_args = fun _ctx ->
+  let agent =
+    mk_agent
+      ~command:"/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
+      ~args:[ "--profile"; "headless"; "{prompt}" ]
+      "deepseek_harness"
+  in
+  match Agent.with_resume agent ~session:"session-abc" with
+  | None -> Error "dsh has no resume"
+  | Some a ->
+      Test.assert_equal
+        ~expected:[ "--profile"; "headless"; "--session-id"; "session-abc"; "{prompt}" ]
+        ~actual:a.Agent.args_template;
+      Ok ()
+
 let test_agent_build_args = fun _ctx ->
   let a = mk_agent ~args:[ "-p"; "--model"; "{model}"; "{prompt}" ] "x" in
   let args = Agent.build_args a ~model:"m1" ~prompt:"hello world" in
@@ -2361,6 +2404,7 @@ let test_activity_scan_fixture = fun _ctx ->
     match List.head summaries with
     | None -> Error "no summaries"
     | Some s ->
+        Test.assert_equal ~expected:"claude" ~actual:s.Activity.agent;
         Test.assert_equal ~expected:"/Users/vajra/demo" ~actual:s.Activity.project;
         Test.assert_equal ~expected:2 ~actual:s.Activity.turns;
         Test.assert_equal
@@ -2368,6 +2412,144 @@ let test_activity_scan_fixture = fun _ctx ->
           ~actual:(String.contains s.Activity.last_excerpt "好的");
         Ok ()
   )
+
+let parent_dir = fun path ->
+  let parts = String.split ~by:"/" path in
+  let rec drop_last = fun acc rest ->
+    match rest with
+    | [] -> acc
+    | [ _ ] -> List.rev acc
+    | head :: tail -> drop_last (head :: acc) tail
+  in
+  match drop_last [] parts with
+  | [] -> "."
+  | segs -> String.concat "/" segs
+
+let write_fixture = fun path contents ->
+  let parent = parent_dir path in
+  let _ = Fs.create_dir_all (Path.from_string parent |> Result.unwrap) in
+  Fs.File.write_all
+    (Fs.File.create (Path.from_string path |> Result.unwrap) |> Result.unwrap)
+    contents
+
+let test_activity_scan_local_agents = fun _ctx ->
+  let fake = "./.oasis-test-data/fake-home-agents" in
+  let _ =
+    write_fixture (fake ^ "/.claude/projects/demo/s1.jsonl")
+      "{\"type\":\"user\",\"sessionId\":\"s1\",\"cwd\":\"/tmp/claude-proj\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n"
+  in
+  let _ =
+    write_fixture (fake ^ "/.cursor/chats/hash/cur1/meta.json")
+      "{\"cwd\":\"/tmp/cursor-proj\",\"hasConversation\":true,\"updatedAtMs\":1}\n"
+  in
+  let _ =
+    write_fixture (fake ^ "/.cursor/projects/p/agent-transcripts/cur1/cur1.jsonl")
+      "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"cursor hello\"}]}}\n"
+  in
+  let _ =
+    write_fixture (fake ^ "/.cursor/projects/p/.workspace-trusted")
+      "{\"workspacePath\":\"/tmp/cursor-proj\"}"
+  in
+  let _ =
+    write_fixture (fake ^ "/.codex/sessions/2026/11/11/rollout.jsonl")
+      "{\"payload\":{\"session_id\":\"cx1\",\"cwd\":\"/tmp/codex-proj\"}}\n"
+  in
+  let _ =
+    write_fixture (fake ^ "/.codex/session_index.jsonl")
+      "{\"id\":\"cx1\",\"thread_name\":\"codex thread\",\"updated_at\":\"2026-11-11T00:00:00.000Z\"}\n"
+  in
+  let _ =
+    write_fixture (fake ^ "/.codex/process_manager/chat_processes.json")
+      "[{\"conversationId\":\"cx1\",\"cwd\":\"/tmp/codex-proj\"}]"
+  in
+  let _ =
+    write_fixture (fake ^ "/.dsh/storages/session_projcache/sessions/dsh1.json")
+      "{\"record\":{\"identity\":{\"cwd\":\"/tmp/dsh-proj\"},\"rows\":{\"title\":{\"val\":\"harness 任务\"}}}}"
+  in
+  let _ = write_fixture (fake ^ "/.dsh/sessions/enc/dsh1/session.lock") "" in
+  let _ =
+    write_fixture (fake ^ "/.workbuddy/projects/proj/wb1.jsonl")
+      "{\"type\":\"message\",\"role\":\"user\",\"cwd\":\"/tmp/wb-proj\",\"sessionId\":\"wb1\",\"content\":[{\"type\":\"text\",\"text\":\"wb hello\"}]}\n"
+  in
+  let _ =
+    write_fixture (fake ^ "/.grok/sessions/%2Ftmp%2Fgrok-proj/gk1/summary.json")
+      "{\"generated_title\":\"grok build\"}"
+  in
+  let _ =
+    write_fixture (fake ^ "/.grok/active_sessions.json")
+      "[{\"session_id\":\"gk1\",\"cwd\":\"/tmp/grok-proj\"}]"
+  in
+  let db = fake ^ "/.zcode/v2/tasks-index.sqlite" in
+  let _ = Fs.create_dir_all (Path.from_string (fake ^ "/.zcode/v2") |> Result.unwrap) in
+  let sql =
+    "DROP TABLE IF EXISTS tasks; CREATE TABLE tasks (workspace_path TEXT, task_id TEXT, title TEXT, task_status TEXT, updated_at INTEGER, deleted INTEGER); INSERT INTO tasks VALUES ('/tmp/zcode-proj','t1','修构建','running',1700000000000,0);"
+  in
+  let stdio =
+    { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Null; stderr = Process.Stderr.Null }
+  in
+  match Process.spawn ~program:"/usr/bin/sqlite3" ~args:[| db; sql |] ~stdio () with
+  | Error _ -> Error "sqlite3 spawn failed"
+  | Ok proc -> (
+      let rec wait () =
+        match Process.try_wait proc with
+        | Ok None ->
+            sleep (Time.Duration.from_millis 20);
+            wait ()
+        | _ -> ()
+      in
+      wait ();
+      let _ = Process.close proc in
+      let summaries = Activity.scan ~home:fake ~limit:20 in
+      let missing = ref "" in
+      let expect =
+        [
+          ("claude", "/tmp/claude-proj", false);
+          ("cursor", "/tmp/cursor-proj", false);
+          ("codex", "/tmp/codex-proj", true);
+          ("deepseek", "/tmp/dsh-proj", true);
+          ("zcode", "/tmp/zcode-proj", true);
+          ("workbuddy", "/tmp/wb-proj", false);
+          ("grok", "/tmp/grok-proj", true);
+        ]
+      in
+      List.for_each expect ~fn:(fun (agent, project, running) ->
+        match List.find summaries ~fn:(fun s -> String.equal s.Activity.agent agent) with
+        | None -> missing := agent
+        | Some s ->
+            if not (String.equal s.Activity.project project) then missing := agent ^ " project";
+            if running && not (s.Activity.running) then missing := agent ^ " running"
+      );
+      let codex =
+        List.find summaries ~fn:(fun s -> String.equal s.Activity.agent "codex")
+      in
+      (
+        match codex with
+        | Some s when not (String.contains s.Activity.last_excerpt "codex thread") ->
+            missing := "codex excerpt"
+        | _ -> ()
+      );
+      (
+        match Activity.observe ~home:fake ~agent:"claude" ~session_id:"s1" with
+        | None -> missing := "observe claude"
+        | Some o -> if not (String.contains o.Activity.text "hello") then missing := "observe claude text"
+      );
+      (
+        match Activity.observe ~home:fake ~agent:"cursor" ~session_id:"cur1" with
+        | None -> missing := "observe cursor"
+        | Some o -> if not (String.contains o.Activity.text "cursor hello") then missing := "observe cursor text"
+      );
+      (
+        match Activity.observe ~home:fake ~agent:"deepseek" ~session_id:"dsh1" with
+        | None -> missing := "observe dsh"
+        | Some o -> if not (String.contains o.Activity.text "harness") then missing := "observe dsh text"
+      );
+      (
+        match Activity.observe ~home:fake ~agent:"zcode" ~session_id:"t1" with
+        | None -> missing := "observe zcode"
+        | Some o -> if not (String.contains o.Activity.text "修构建") then missing := "observe zcode text"
+      );
+      if String.is_empty !missing then Ok () else Error ("activity missing " ^ !missing)
+    )
 
 let test_signals_release_in_flight = fun _ctx ->
   let s = Signals.mark_in_flight (Signals.fresh ()) in
@@ -3432,6 +3614,53 @@ let chat_body = fun text ->
   Json.to_string
     (Json.obj [ ("messages", Json.array [ Json.obj [ ("role", Json.string "user"); ("content", Json.string text) ] ]) ])
 
+(** A committee does not wait out a silent member, and a short caller limit
+    does not throw away the answers that already came back. *)
+let test_gateway_committee_seat_timeout = fun _ctx ->
+  match start_mocks 3 with
+  | Error e -> Error e
+  | Ok mocks -> (
+      List.enumerate mocks
+      |> List.for_each ~fn:(fun (i, m) ->
+        let slow = i = 2 in
+        Mock.set_scenario m
+          {
+            (Mock.default_scenario) with
+            body = openai_ok_body ~content:(if slow then "slow-answer" else "answer-" ^ Int.to_string i);
+            delay_ms = if slow then 8000 else 0;
+          });
+      match Gateway.start ~config_path:None ~config:(handoff_config mocks) ~port:0 () with
+      | Error e -> Error ("gateway: " ^ e)
+      | Ok gw -> (
+          let post ~timeout members =
+            gw_post ~port:gw.port ~path:"/v1/chat/completions"
+              ~headers:
+                [
+                  ("Content-Type", "application/json");
+                  ("X-Oasis-Committee", members);
+                  ("X-Oasis-Timeout", timeout);
+                ]
+              ~body:(chat_body "q")
+          in
+          match post ~timeout:"1" "acc_0, acc_1" with
+          | Error e -> Error e
+          | Ok (status, resp) -> (
+              Test.assert_equal ~expected:200 ~actual:status;
+              Test.assert_equal ~expected:false ~actual:(String.contains resp "cancelled:timeout");
+              Test.assert_equal ~expected:true ~actual:(String.contains resp "answer-0");
+              Test.assert_equal ~expected:true ~actual:(String.contains resp "answer-1");
+              let t0 = Oasis.Signals.now_ms () in
+              match post ~timeout:"1" "acc_0, acc_1, acc_2" with
+              | Error e -> Error e
+              | Ok (status2, resp2) -> (
+                  Test.assert_equal ~expected:200 ~actual:status2;
+                  Test.assert_equal ~expected:true ~actual:(String.contains resp2 "answer-0");
+                  Test.assert_equal ~expected:true ~actual:(String.contains resp2 "answer-1");
+                  Test.assert_equal ~expected:true ~actual:(String.contains resp2 "超过席位时限（1s）");
+                  Test.assert_equal ~expected:false ~actual:(String.contains resp2 "slow-answer");
+                  Test.assert_equal ~expected:true ~actual:(Oasis.Signals.now_ms () - t0 < 6000);
+                  Ok ()))))
+
 let test_gateway_client_deadline_accounts = fun _ctx ->
   match start_mocks 2 with
   | Error e -> Error e
@@ -3613,8 +3842,20 @@ let test_signals_classify_error = fun _ctx ->
   Test.assert_equal ~expected:"transient" ~actual:(c (Some 429) "{\"error\":\"rate limited\"}");
   Test.assert_equal ~expected:"quota" ~actual:(c ~codes:[ "E_TOKENS_GONE" ] (Some 429) "E_TOKENS_GONE");
   Test.assert_equal ~expected:"client_auth" ~actual:(c (Some 401) "");
+  Test.assert_equal ~expected:"client_auth" ~actual:(c (Some 401) "quota exceeded");
   Test.assert_equal ~expected:"client_auth" ~actual:(c (Some 403) "");
+  Test.assert_equal
+    ~expected:"quota"
+    ~actual:(c (Some 403) "You've reached your usage limit for this billing cycle. Your quota will be refreshed. insufficient balance");
   Test.assert_equal ~expected:"client" ~actual:(c (Some 400) "");
+  let poisoned = { (Signals.fresh ()) with Signals.auth_invalid = true; Signals.in_flight = 1 } in
+  let parked = Signals.record_quota poisoned ~error:"upstream_http_403: quota" ~until_ms:10 in
+  Test.assert_equal ~expected:false ~actual:parked.Signals.auth_invalid;
+  Test.assert_equal ~expected:10 ~actual:parked.Signals.parked_until_ms;
+  Test.assert_equal
+    ~expected:"被限流或额度不足"
+    ~actual:(Feed.error_text "upstream_http_403: insufficient balance, quota refreshed next cycle");
+  Test.assert_equal ~expected:"认证失败：key 失效或需要重新登录" ~actual:(Feed.error_text "upstream_http_401: invalid_api_key");
   Test.assert_equal ~expected:"client" ~actual:(c (Some 413) "");
   Test.assert_equal ~expected:"transient" ~actual:(c (Some 503) "quota");
   Test.assert_equal ~expected:"transient" ~actual:(c None "");
@@ -3928,6 +4169,26 @@ let test_observe_ignores_quoted_plan = fun _ctx ->
   let actual = show_seen s in
   if not (String.equal "|||" actual) then panic actual;
   Ok ()
+
+let test_workbuddy_uses_the_bundle_that_exists = fun _ctx ->
+  let lite = Agent.codebuddy_bundle_vars ~lite:true ~headless:false in
+  let both = Agent.codebuddy_bundle_vars ~lite:true ~headless:true in
+  let neither = Agent.codebuddy_bundle_vars ~lite:false ~headless:false in
+  let forces pairs =
+    List.any pairs ~fn:(fun (k, v) -> String.equal k "CODEBUDDY_FORCE_LITE_WB_BUNDLE" && String.equal v "1")
+  in
+  if not (forces lite) then Error "lite bundle was not selected" else
+  if forces both then Error "an existing headless bundle was ignored" else
+  if forces neither then Error "a missing lite bundle was forced" else
+  if not (Agent.missing_codebuddy_bundle "Error: Cannot find module '../dist/codebuddy'") then
+    Error "missing bundle was not recognized"
+  else if not (Agent.prefer_desktop_bridge ~command:"codebuddy" ~script_exists:true ~endpoint_exists:true) then
+    Error "a running WorkBuddy desktop was not used"
+  else if Agent.prefer_desktop_bridge ~command:"codebuddy" ~script_exists:true ~endpoint_exists:false then
+    Error "a missing desktop broker was used"
+  else if Agent.prefer_desktop_bridge ~command:"claude" ~script_exists:true ~endpoint_exists:true then
+    Error "another agent was sent through the WorkBuddy desktop"
+  else Ok ()
 
 let test_bundled_agents_take_a_prompt = fun _ctx ->
   let ids = [ "codex_cli"; "zcode"; "deepseek_harness"; "workbuddy"; "openclaw"; "hermes"; "pi" ] in
@@ -4456,6 +4717,38 @@ let test_agent_finished_turn_does_not_wait = fun _ctx ->
       Test.assert_equal ~expected:true ~actual:(Time.Duration.to_millis (Time.Instant.elapsed t0) < 8000);
       Ok ()
 
+let test_agent_silence_limit = fun _ctx ->
+  let codex =
+    mk_agent
+      ~command:"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+      "codex_cli"
+  in
+  let grok = mk_agent ~command:"/usr/local/bin/grok" "grok_cli" in
+  Test.assert_equal ~expected:120 ~actual:(Agent.idle_s_of codex);
+  Test.assert_equal ~expected:600 ~actual:(Agent.idle_s_of grok);
+  Test.assert_equal ~expected:"进程还在，但持续没有任何输出，已停止" ~actual:(Feed.error_text "agent idle (120s) with no answer");
+  Ok ()
+
+(** A process that never writes is failed and killed, not waited out. *)
+let test_agent_silent_process_fails = fun _ctx ->
+  let a = mk_agent ~command:"/bin/sleep" ~args:[ "30" ] ~timeout_s:0 "agent_silent" in
+  let me = self () in
+  let t0 = Time.Instant.now () in
+  let _ =
+    Runtime.spawn_blocked (fun () ->
+      let res = Agent.collect ~idle_s:1 ~agent:a ~model:"" ~prompt:"" () in
+      send me (Agent_collect_done res);
+      Ok ())
+  in
+  let selector msg = match msg with Agent_collect_done r -> Select r | _ -> Skip in
+  match receive ~selector ~timeout:(Time.Duration.from_secs 15) () with
+  | exception Receive_timeout -> Error "collect waited out a process that never wrote anything"
+  | Ok text -> Error ("expected silence to fail, got: " ^ text)
+  | Error e ->
+      Test.assert_equal ~expected:true ~actual:(String.contains e "agent idle (1s)");
+      Test.assert_equal ~expected:true ~actual:(Time.Duration.to_millis (Time.Instant.elapsed t0) < 8000);
+      Ok ()
+
 let test_agent_idle_after_answer_closes = fun _ctx ->
   let a =
     mk_agent ~args:[ "-c"; "printf '%s\\n' 'plain answer'; sleep 30" ] ~timeout_s:0 "agent_idle"
@@ -4517,6 +4810,9 @@ let tests =
     case ~size:Test.Large "gateway: anthropic protocol non-stream + stream" test_gateway_anthropic_non_stream_and_stream;
     case ~size:Test.Large "gateway: cross-protocol seamless handoff" test_gateway_cross_protocol_seamless_handoff;
     case "agent: args template" test_agent_build_args;
+    case "agent: codex resume keeps exec flags" test_codex_resume_args;
+    case "agent: deepseek resume follows the profile" test_dsh_resume_args;
+    case "activity: deepseek turn closed" test_dsh_turn_closed;
     case "agent: claude stream-json parse" test_agent_claude_stream_json_parse;
     case "agent: cursor stream-json parse" test_agent_cursor_stream_json_parse;
     case "steps: parse claude/cursor/gemini/kimi/grok events" test_steps_parse_agents;
@@ -4524,6 +4820,8 @@ let tests =
     case "steps: clip keeps utf-8 valid" test_steps_clip_utf8;
     case ~size:Test.Large "agent: exit reaps helpers that keep stdout open" test_agent_exit_reaps_lingering_helpers;
     case ~size:Test.Large "agent: a finished grok turn is closed" test_agent_finished_turn_does_not_wait;
+    case "agent: silence limit is two minutes, ten for grok" test_agent_silence_limit;
+    case ~size:Test.Large "agent: a silent process fails instead of waiting" test_agent_silent_process_fails;
     case ~size:Test.Large "agent: silence after an answer closes the run" test_agent_idle_after_answer_closes;
     case "classify: prompt content to category" test_classify_prompts;
     case "router: latency scored relative to the fastest" test_router_relative_latency;
@@ -4534,6 +4832,7 @@ let tests =
     case "gateway: committee answers and synthesis" test_gateway_committee;
     case "gateway: committee can include an agent" test_gateway_committee_includes_agent;
     case "gateway: committee uses the requested workdir" test_committee_uses_requested_workdir;
+    case ~size:Test.Large "gateway: committee drops a seat that misses its deadline" test_gateway_committee_seat_timeout;
     case "gateway: thread follow-up carries the conversation" test_gateway_thread_carries_history;
     case ~size:Test.Large "agent: tree dies with the gateway" test_agent_dies_with_gateway;
     case "thread: running turns become interrupted on restart" test_thread_marks_interrupted_turns;
@@ -4563,6 +4862,7 @@ let tests =
     case "inbox: unverified prefix, 16KB cap, recipient names" test_inbox_prefix_limit_and_names;
     case "discover: scan fixture" test_discover_scan_fixture;
     case "activity: scan fixture" test_activity_scan_fixture;
+    case "activity: local agents" test_activity_scan_local_agents;
     case ~size:Test.Large "gateway: inbox MCP roundtrip" test_gateway_inbox_mcp;
     case ~size:Test.Large "agent: HOME env injection" test_agent_home_env_injection;
     case ~size:Test.Large "gateway: agent async task + poll" test_gateway_agent_async_task;
@@ -4607,6 +4907,7 @@ let tests =
     case "observe: snapshot tree is read from data.tree" test_observe_snapshot_tree;
     case "observe: a quoted plan inside chat is not a reading" test_observe_ignores_quoted_plan;
     case "setup: bundled agent CLIs take a prompt" test_bundled_agents_take_a_prompt;
+    case "setup: workbuddy uses the bundle that exists" test_workbuddy_uses_the_bundle_that_exists;
     case "setup: merge with no choices keeps the file byte for byte" test_setup_merge_noop_keeps_text;
     case "setup: merge toggles, adds, extends routes, keeps user lines" test_setup_merge_changes;
     case "setup: fresh config keeps skeleton order" test_setup_fresh_skeleton_order;

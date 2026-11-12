@@ -105,7 +105,9 @@ let contains_ci = fun haystack needle ->
 
 (** [classify_error ~status ~body ~quota_codes] decides how a failed upstream
     call affects the account: [Quota] parks it until its quota resets,
-    [Client] errors never trip the breaker, everything else is [Transient]. *)
+    [Client] errors never trip the breaker, everything else is [Transient].
+    A 403 whose body says the quota or balance is gone is a park, not a dead
+    key: the key was accepted. A 401 stays a dead key. *)
 let classify_error = fun ~(status : int option) ~(body : string) ~(quota_codes : string list) ->
   let quota_marked () =
     List.any (default_quota_markers @ quota_codes) ~fn:(fun m -> contains_ci body m)
@@ -113,6 +115,7 @@ let classify_error = fun ~(status : int option) ~(body : string) ~(quota_codes :
   match status with
   | Some 402 -> Quota
   | Some 429 -> if quota_marked () then Quota else Transient
+  | Some 403 when quota_marked () -> Quota
   | Some (401 | 403) -> Client { auth = true }
   | Some (400 | 404 | 413 | 422) -> Client { auth = false }
   | _ -> Transient
@@ -270,13 +273,15 @@ let record_failure = fun (s : signals) ~error now_ms ->
   }
 
 (** Quota/balance exhaustion: park until [until_ms]. Not a latency sample and
-    not a breaker event — probing every 30s would only burn requests. *)
+    not a breaker event — probing every 30s would only burn requests.
+    The key was accepted, so a previously stored auth failure is cleared. *)
 let record_quota = fun (s : signals) ~error ~until_ms ->
   {
     s with
     in_flight = max 0 (s.in_flight - 1);
     parked_until_ms = max s.parked_until_ms until_ms;
     last_error = Some (redact_secrets error);
+    auth_invalid = false;
   }
 
 (** The request itself was rejected (4xx): no breaker impact; 401/403 flag

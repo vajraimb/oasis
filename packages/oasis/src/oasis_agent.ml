@@ -83,13 +83,39 @@ let resume_args = fun (a : agent) ->
 
 (** The agent set up to continue [session], or None when its CLI has no
     known way to resume. The resume flags go first: some templates end in
-    a flag that takes the prompt as its value ([-p {prompt}]). *)
+    a flag that takes the prompt as its value ([-p {prompt}]). DeepSeek's
+    headless profile is the exception: [--session-id] belongs to the profile,
+    so it has to follow [--profile headless] and sit in front of the task. *)
 let with_resume = fun (a : agent) ~session ->
-  match resume_args a with
-  | [] -> None
-  | ra ->
-      let ra = List.map ra ~fn:(fun x -> if String.equal x "{session}" then session else x) in
-      Some { a with args_template = ra @ a.args_template }
+  match command_name a with
+  | "codex" ->
+      (* `exec resume <id>` keeps the flags that already follow `exec`. *)
+      let rest =
+        match a.args_template with
+        | "exec" :: tail -> tail
+        | other -> other
+      in
+      Some { a with args_template = "exec" :: "resume" :: session :: rest }
+  | "dsh" -> (
+      match resume_args a with
+      | [] -> None
+      | ra ->
+          let ra = List.map ra ~fn:(fun x -> if String.equal x "{session}" then session else x) in
+          let rec before_prompt = fun acc rest ->
+            match rest with
+            | [] -> List.rev acc @ ra
+            | "{prompt}" :: tail -> List.rev acc @ ra @ ("{prompt}" :: tail)
+            | head :: tail -> before_prompt (head :: acc) tail
+          in
+          Some { a with args_template = before_prompt [] a.args_template }
+    )
+  | _ -> (
+      match resume_args a with
+      | [] -> None
+      | ra ->
+          let ra = List.map ra ~fn:(fun x -> if String.equal x "{session}" then session else x) in
+          Some { a with args_template = ra @ a.args_template }
+    )
 
 (** The CLI session id a stdout line announces ([session_id] for claude,
     cursor-agent, gemini; [sessionId] for grok). *)
@@ -229,16 +255,90 @@ let use_workdir = fun (a : agent) raw ->
     particular) is dropped. *)
 let base_env_keys = [ "PATH"; "LANG"; "LC_ALL"; "TERM"; "USER"; "LOGNAME"; "SHELL"; "TMPDIR" ]
 
+let file_exists = fun path ->
+  match Path.from_string path with
+  | Error _ -> false
+  | Ok p -> (match Fs.exists p with Ok true -> true | _ -> false)
+
+(** The desktop app is logged in, but a standalone [codebuddy] cannot decrypt
+    that session. When the app is running it publishes a local broker, and
+    [workbuddy-desktop] sends the prompt through it. *)
+let prefer_desktop_bridge = fun ~command ~script_exists ~endpoint_exists ->
+  String.equal command "codebuddy" && script_exists && endpoint_exists
+
+let desktop_script = fun () ->
+  match Env.var Env.String ~name:"HOME" with
+  | None -> None
+  | Some home ->
+      let installed = home ^ "/.oasis/bin/workbuddy-desktop" in
+      if file_exists installed then Some installed
+      else
+        match Env.current_dir () with
+        | Ok cwd ->
+            let dev = Path.to_string cwd ^ "/scripts/workbuddy-desktop" in
+            if file_exists dev then Some dev else None
+        | Error _ -> None
+
+let via_desktop = fun (a : agent) ->
+  if not (String.equal (command_name a) "codebuddy") then a
+  else
+    match Env.var Env.String ~name:"HOME" with
+    | None -> a
+    | Some home ->
+        let endpoint = home ^ "/.workbuddy/wbipc/endpoint.json" in
+        match desktop_script () with
+        | Some script when prefer_desktop_bridge ~command:"codebuddy" ~script_exists:true ~endpoint_exists:(file_exists endpoint) ->
+            { a with command = script; args_template = [ "{prompt}" ]; resume_args = [] }
+        | _ -> a
+
+(** [cli/bin/codebuddy] -> [cli/dist]. A bare command uses the app bundle. *)
+let codebuddy_dist = fun command ->
+  let script =
+    if String.contains command "/" then command
+    else "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+  in
+  match List.rev (String.split ~by:"/" script) with
+  | _file :: "bin" :: rest -> String.concat "/" (List.rev ("dist" :: rest))
+  | _ -> ""
+
+(** WorkBuddy 5.9 ships only [codebuddy-lite-wb.mjs]. [codebuddy -p] otherwise
+    loads [dist/codebuddy-headless], and when that file is gone the script
+    falls through to [dist/codebuddy] and exits 1. The lite bundle is the one
+    that exists, and later releases still fall back from it. *)
+let codebuddy_bundle_vars = fun ~lite ~headless ->
+  if lite && not headless then [ ("CODEBUDDY_FORCE_LITE_WB_BUNDLE", "1") ] else []
+
+let codebuddy_bundle_env = fun command ->
+  let dist = codebuddy_dist command in
+  if String.is_empty dist then []
+  else
+    let lite =
+      file_exists (dist ^ "/codebuddy-lite-wb.mjs") || file_exists (dist ^ "/codebuddy-lite-wb.js")
+    in
+    let headless =
+      file_exists (dist ^ "/codebuddy-headless.js") || file_exists (dist ^ "/codebuddy-headless.cjs")
+    in
+    codebuddy_bundle_vars ~lite ~headless
+
+let env_forces_lite = fun pairs ->
+  List.any pairs ~fn:(fun (k, v) ->
+    String.equal k "CODEBUDDY_FORCE_LITE_WB_BUNDLE" && (String.equal v "1" || String.equal v "true"))
+
+let missing_codebuddy_bundle = fun note ->
+  let e = String.lowercase_ascii note in
+  String.contains e "cannot find module '../dist/codebuddy"
+  || String.contains e "cannot find module \"../dist/codebuddy"
+
 (** Variables a known CLI needs on top of [child_env]. WorkBuddy otherwise
     downloads its built-in plugin marketplaces before answering. That
     download writes nothing to stdout, so the run looks empty until it is
     cancelled. *)
 let cli_env = fun (a : agent) ->
   match command_name a with
-  | "codebuddy" -> [ ("CODEBUDDY_SKIP_BUILTIN_MARKETPLACE", "1") ]
+  | "codebuddy" -> ("CODEBUDDY_SKIP_BUILTIN_MARKETPLACE", "1") :: codebuddy_bundle_env a.command
   | _ -> []
 
-let child_env = fun (a : agent) ->
+let child_env = fun ?(extra = []) (a : agent) ->
   let inherited =
     base_env_keys @ a.env_passthrough
     |> List.filter ~fn:(fun k -> not (String.equal k "HOME"))
@@ -255,12 +355,16 @@ let child_env = fun (a : agent) ->
     | Some h -> ("HOME", h) :: inherited
     | None -> inherited
   in
-  let extra = cli_env a in
-  let base =
-    List.filter base ~fn:(fun (k, _) ->
+  let from_cli =
+    List.filter (cli_env a) ~fn:(fun (k, _) ->
       not (List.any extra ~fn:(fun (ek, _) -> String.equal ek k)))
   in
-  extra @ base
+  let launch = from_cli @ extra in
+  let base =
+    List.filter base ~fn:(fun (k, _) ->
+      not (List.any launch ~fn:(fun (ek, _) -> String.equal ek k)))
+  in
+  launch @ base
 
 (* ---------- execution ---------- *)
 
@@ -309,7 +413,7 @@ let absolute = fun dir ->
         Path.to_string cwd ^ "/" ^ rel
     | Error _ -> dir
 
-let spawn_proc = fun ~(agent : agent) ~args () ->
+let spawn_proc = fun ?(extra = []) ~(agent : agent) ~args () ->
   let stdio =
     {
       Process.stdin = Process.Stdin.Null;
@@ -321,7 +425,7 @@ let spawn_proc = fun ~(agent : agent) ~args () ->
     if String.is_empty agent.workdir then None
     else Some (Path.from_string agent.workdir |> Result.unwrap)
   in
-  let env_args = List.map (child_env agent) ~fn:(fun (k, v) -> k ^ "=" ^ v) in
+  let env_args = List.map (child_env ~extra agent) ~fn:(fun (k, v) -> k ^ "=" ^ v) in
   (* perl leads a fresh process group so the watchdog can kill the whole
      tree (gemini re-execs into a node child that outlives a SIGKILL of the
      parent). It also reaps the group once the agent exits: helpers such as
@@ -355,6 +459,25 @@ kill 'KILL', @all;|}
 
 (** SIGKILL the process group led by [proc] (see [spawn_proc]) and every
     descendant, wherever its process group. *)
+(** [Process.close] only closes pipes; it does not waitpid. *)
+let reap_until = fun proc ~n ->
+  let rec go n =
+    match Process.try_wait proc with
+    | Ok (Some (Process.Exited _ | Process.Signaled _)) | Error _ -> true
+    | Ok None | Ok (Some (Process.Running | Process.Stopped _)) ->
+        if n <= 0 then false
+        else (
+          sleep (Time.Duration.from_millis 10);
+          go (n - 1)
+        )
+  in
+  go n
+
+let reap_close = fun proc ->
+  let _ = reap_until proc ~n:200 in
+  let _ = Process.close proc in
+  ()
+
 let kill_group = fun (proc : Process.t) ->
   let stdio = { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Null; stderr = Process.Stderr.Null } in
   (match
@@ -362,15 +485,11 @@ let kill_group = fun (proc : Process.t) ->
    with
    | Error _ -> ()
    | Ok k ->
-       let rec reap n =
-         match Process.try_wait k with
-         | Ok (Some _) | Error _ -> ()
-         | Ok None -> if n > 0 then (sleep (Time.Duration.from_millis 10); reap (n - 1))
-       in
-       reap 100;
+       let _ = reap_until k ~n:200 in
        let _ = Process.close k in
        ());
   let _ = Process.kill proc ~signal:9 in
+  let _ = reap_until proc ~n:200 in
   ()
 
 let watchdog = fun ~(proc : Process.t) ~timeout_s ~to_pid ~leg ->
@@ -417,8 +536,8 @@ let explain_note = fun note ->
     |> String.trim
   in
   if String.is_empty note then ""
-  else if String.contains note "use /login" then
-    "WorkBuddy 的命令行还没登录。打开终端运行 codebuddy，输入 /login 完成登录后再试。\n" ^ note
+  else if String.contains note "use /login" || String.contains (String.lowercase_ascii note) "authentication required" then
+    "WorkBuddy 桌面版的登录是加密的，单独拉起的命令行解不开。先打开 WorkBuddy 桌面应用，Oasis 会走它已经登好的账号。\n" ^ note
   else
     note
 
@@ -433,10 +552,15 @@ type drain_stop =
     no stdout or stderr, the process is the leftover login refresh. *)
 let grok_idle_s = 600
 
+(** Two minutes. Any stdout or stderr byte resets the clock, so a long tool
+    run that keeps printing is left alone. A process that stays completely
+    quiet is not working. *)
+let silence_s = 120
+
 let idle_s_of = fun (a : agent) ->
   match command_name a with
   | "grok" -> grok_idle_s
-  | _ -> 0
+  | _ -> silence_s
 
 (** Poll both pipes without [Fs.File.read]. That helper waits until one fd
     is readable, so a quiet stderr stalls the loop while stdout fills and
@@ -530,86 +654,114 @@ let exit_code = fun ~proc ->
 (** Synchronous collection; call ONLY from a blocking lane. [on_line] sees
     every raw stdout line (for step extraction by the caller). *)
 let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn = fun (_ : Process.t) -> ()) ~(agent : agent) ~model ~prompt () ->
+  let agent = via_desktop agent in
   let args =
     let arg_list = build_args agent ~model ~prompt in
     Array.init ~count:(List.length arg_list) ~fn:(fun i -> List.get_unchecked arg_list ~at:i)
   in
-  match spawn_proc ~agent ~args () with
-  | Error e -> Error ("agent spawn failed: " ^ Process.error_to_string e)
-  | Ok proc ->
-      on_spawn proc;
-      watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid:(self ()) ~leg:0;
-      let buf = ref "" in
-      let jn = Oasis_steps.joiner () in
-      let turn_done = ref false in
-      let observe = on_line in
-      let on_line line =
-        if Oasis_steps.turn_finished ~command:agent.command line then turn_done := true;
-        observe line;
-        let text, _ = consume_line jn ~command:agent.command line in
-        buf := !buf ^ text
-      in
-      let idle_s = if idle_s < 0 then idle_s_of agent else idle_s in
-      let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
-      let code = exit_code ~proc in
-      let _ = Process.close proc in
-      let with_note = fun msg -> if String.is_empty note then msg else msg ^ ": " ^ note in
-      let closed_with_answer =
-        match why with
-        | Turn_finished -> true
-        | Idle -> not (String.is_empty (String.trim !buf))
-        | Process_exit -> false
-      in
-      (* A finished grok turn often leaves the process up. The text it
-         already wrote is the answer, not a failure. *)
-      if closed_with_answer then Ok !buf
-      else
-        match why with
-        | Idle -> Error (with_note ("agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"))
-        | Turn_finished | Process_exit ->
-            (* WorkBuddy reports "not logged in" on stderr and still exits 0. *)
-            if code = 0 && not (String.is_empty (String.trim !buf)) then Ok !buf
-            else if code = 0 && not (String.is_empty note) then Error note
-            else if code = 0 then Ok !buf
-            else if code = 137 && agent.timeout_s > 0 then
-              Error (with_note ("agent timeout (" ^ Int.to_string agent.timeout_s ^ "s)"))
-            else if code = 137 then Error (with_note "agent killed (SIGKILL)")
-            else Error (with_note ("agent exited with code " ^ Int.to_string code))
+  let idle_s = if idle_s < 0 then idle_s_of agent else idle_s in
+  let lite_retry = [ ("CODEBUDDY_FORCE_LITE_WB_BUNDLE", "1") ] in
+  let retry_bundle = fun ~extra ~code ~note ->
+    not (code = 0)
+    && String.equal (command_name agent) "codebuddy"
+    && missing_codebuddy_bundle note
+    && not (env_forces_lite extra)
+    && not (env_forces_lite (cli_env agent))
+  in
+  let rec launch extra =
+    match spawn_proc ~extra ~agent ~args () with
+    | Error e -> Error ("agent spawn failed: " ^ Process.error_to_string e)
+    | Ok proc ->
+        on_spawn proc;
+        watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid:(self ()) ~leg:0;
+        let buf = ref "" in
+        let jn = Oasis_steps.joiner () in
+        let turn_done = ref false in
+        let observe = on_line in
+        let on_line line =
+          if Oasis_steps.turn_finished ~command:agent.command line then turn_done := true;
+          observe line;
+          let text, _ = consume_line jn ~command:agent.command line in
+          buf := !buf ^ text
+        in
+        let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
+        let code = exit_code ~proc in
+        reap_close proc;
+        if retry_bundle ~extra ~code ~note then launch lite_retry
+        else
+          let with_note = fun msg -> if String.is_empty note then msg else msg ^ ": " ^ note in
+          let closed_with_answer =
+            match why with
+            | Turn_finished -> true
+            | Idle -> not (String.is_empty (String.trim !buf))
+            | Process_exit -> false
+          in
+          (* A finished grok turn often leaves the process up. The text it
+             already wrote is the answer, not a failure. *)
+          if closed_with_answer then Ok !buf
+          else
+            match why with
+            | Idle -> Error (with_note ("agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"))
+            | Turn_finished | Process_exit ->
+                (* WorkBuddy reports "not logged in" on stderr and still exits 0. *)
+                if code = 0 && not (String.is_empty (String.trim !buf)) then Ok !buf
+                else if code = 0 && not (String.is_empty note) then Error note
+                else if code = 0 then Ok !buf
+                else if code = 137 && agent.timeout_s > 0 then
+                  Error (with_note ("agent timeout (" ^ Int.to_string agent.timeout_s ^ "s)"))
+                else if code = 137 then Error (with_note "agent killed (SIGKILL)")
+                else Error (with_note ("agent exited with code " ^ Int.to_string code))
+  in
+  launch []
 
 (** Streaming run; call ONLY from a blocking lane. Lines go to [to_pid] as
     [Agent_line], the exit code as [Agent_done]. *)
 let stream = fun ~(agent : agent) ~model ~prompt ~to_pid ~leg () ->
+  let agent = via_desktop agent in
   let args =
     let arg_list = build_args agent ~model ~prompt in
     Array.init ~count:(List.length arg_list) ~fn:(fun i -> List.get_unchecked arg_list ~at:i)
   in
-  match spawn_proc ~agent ~args () with
-  | Error e ->
-      send to_pid (Agent_done (leg, -1, ""));
-      Ok ()
-  | Ok proc ->
-      send to_pid (Agent_spawned (leg, proc));
-      watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid ~leg;
-      let turn_done = ref false in
-      let saw_text = ref false in
-      let on_line line =
-        if Oasis_steps.turn_finished ~command:agent.command line then turn_done := true;
-        (match extract_text ~command:agent.command line with Some _ -> saw_text := true | None -> ());
-        send to_pid (Agent_line (leg, line))
-      in
-      let idle_s = idle_s_of agent in
-      let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
-      let code =
-        match why with
-        | Turn_finished -> 0
-        | Idle when !saw_text -> 0
-        | Idle | Process_exit -> exit_code ~proc
-      in
-      let note =
-        match why with
-        | Idle when not !saw_text -> "agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"
-        | _ -> note
-      in
-      let _ = Process.close proc in
-      send to_pid (Agent_done (leg, code, note));
-      Ok ()
+  let idle_s = idle_s_of agent in
+  let lite_retry = [ ("CODEBUDDY_FORCE_LITE_WB_BUNDLE", "1") ] in
+  let retry_bundle = fun ~extra ~code ~note ->
+    not (code = 0)
+    && String.equal (command_name agent) "codebuddy"
+    && missing_codebuddy_bundle note
+    && not (env_forces_lite extra)
+    && not (env_forces_lite (cli_env agent))
+  in
+  let rec launch extra =
+    match spawn_proc ~extra ~agent ~args () with
+    | Error _ ->
+        send to_pid (Agent_done (leg, -1, ""));
+        Ok ()
+    | Ok proc ->
+        send to_pid (Agent_spawned (leg, proc));
+        watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid ~leg;
+        let turn_done = ref false in
+        let saw_text = ref false in
+        let on_line line =
+          if Oasis_steps.turn_finished ~command:agent.command line then turn_done := true;
+          (match extract_text ~command:agent.command line with Some _ -> saw_text := true | None -> ());
+          send to_pid (Agent_line (leg, line))
+        in
+        let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
+        let code =
+          match why with
+          | Turn_finished -> 0
+          | Idle when !saw_text -> 0
+          | Idle | Process_exit -> exit_code ~proc
+        in
+        let note =
+          match why with
+          | Idle when not !saw_text -> "agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"
+          | _ -> note
+        in
+        reap_close proc;
+        if retry_bundle ~extra ~code ~note then launch lite_retry
+        else (
+          send to_pid (Agent_done (leg, code, note));
+          Ok ())
+  in
+  launch []

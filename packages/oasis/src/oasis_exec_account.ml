@@ -332,7 +332,6 @@ let handle_chat = fun (state : state) (ctx : Trail.ctx) ->
     |> Option.unwrap_or ~default:config.Oasis_config.policy.Oasis_config.goal
   in
   let request_id = new_request_id () in
-  (match header_timeout ctx with Some secs -> arm_deadline state ~request_id ~secs | None -> ());
   audit_log
     state
     ~path:"/v1/chat/completions"
@@ -375,6 +374,11 @@ let handle_chat = fun (state : state) (ctx : Trail.ctx) ->
   let pinned_agent =
     get_header ctx "x-oasis-agent" |> Option.map ~fn:String.trim |> Option.and_then ~fn:(fun a -> if String.is_empty a then None else Some a)
   in
+  let resume_sid =
+    match get_header ctx "x-oasis-resume" |> Option.map ~fn:String.trim with
+    | Some s when not (String.is_empty s) -> Some s
+    | _ -> None
+  in
   let explicit_mode = Option.is_some (get_header ctx "x-oasis-mode") || Option.is_some pinned_agent in
   (* a follow-up without its own routing headers continues the way the
      previous turn ran *)
@@ -398,9 +402,18 @@ let handle_chat = fun (state : state) (ctx : Trail.ctx) ->
     | Some _ as w -> w
     | None -> (match prior with Some th -> clean th.Oasis_thread.workdir | None -> None)
   in
+  let seat_timeout_s =
+    match header_timeout ctx with
+    | Some secs -> secs
+    | None -> Oasis_committee.default_seat_timeout_s
+  in
+  (* A committee keeps the answers that arrived. The header bounds each seat
+     instead of cancelling the whole request. *)
+  if List.is_empty committee then
+    (match header_timeout ctx with Some secs -> arm_deadline state ~request_id ~secs | None -> ());
   if not (List.is_empty committee) then
     Oasis_committee.handle state ctx body ~members:committee ~category ~goal ~request_id ~workspace:thread_id
-      ~workdir:requested_workdir
+      ~workdir:requested_workdir ~seat_timeout_s
   else
   let mode =
     match get_header ctx "x-oasis-mode" with
@@ -426,7 +439,7 @@ let handle_chat = fun (state : state) (ctx : Trail.ctx) ->
     && not (List.is_empty config.Oasis_config.agents)
   in
   if use_agent then
-    handle_chat_agent ?pinned:pinned_agent
+    handle_chat_agent ?pinned:pinned_agent ?resume:resume_sid
       ?prefer:(if String.equal last_mode "agent" && not (String.is_empty last_executor) then Some last_executor else None)
       ?thread:prior ?workspace:(Oasis_thread.workspace_for prior ~id:thread_id) ?workdir:requested_workdir
       state ctx body ~category ~stream_requested ~request_id

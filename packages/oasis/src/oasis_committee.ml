@@ -3,9 +3,10 @@ open Std.Collections
 
 (** Committee mode: the same question goes to 2–3 chosen members in parallel.
     A member is an API account or a local agent. Each answer lands on the
-    task timeline as it arrives, then the router picks one model to write a
-    synthesis. The reply is the synthesis followed by every member's own
-    answer. *)
+    task timeline as it arrives. A seat that is still silent when its limit
+    runs out is failed and stopped; the router then picks one model to
+    summarize whoever answered. The reply is that summary followed by every
+    member's own answer. *)
 
 module Trail = Oasis_net.Trail
 module Json = Std.Data.Json
@@ -18,6 +19,11 @@ open Oasis_decisions
 let min_members = 2
 
 let max_members = 3
+
+(** A seat that is still silent after this many seconds is a failed member.
+    The people who already answered are still summarized. [X-Oasis-Timeout]
+    replaces the number. A normal chat has no such limit. *)
+let default_seat_timeout_s = 180
 
 (** ["a, b,a"] → [["a"; "b"]] *)
 let parse_members = fun (header : string) ->
@@ -264,7 +270,8 @@ let completion_json = fun ~request_id ~(content : string) (extra : (string * Jso
     @ extra)
 
 let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : string list) ~(category : string)
-    ~(goal : Oasis_router.goal) ~(request_id : string) ~(workspace : string) ~(workdir : string option) ->
+    ~(goal : Oasis_router.goal) ~(request_id : string) ~(workspace : string) ~(workdir : string option)
+    ~(seat_timeout_s : int) ->
   let config = Sync.Atomic.get state.config in
   let reject msg =
     emit_task_done ~error:msg state ~request_id ~chosen:None ~attempts:0 ~ok:false;
@@ -301,6 +308,8 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
     | Error e -> reject e
     | Ok shared -> (
     let n = List.length seats in
+    let seat_limit = if seat_timeout_s > 0 then seat_timeout_s else default_seat_timeout_s in
+    let seat_timeout_error = "超过席位时限（" ^ Int.to_string seat_limit ^ "s），不再等待" in
     let tokens = List.map seats ~fn:(fun (token, _) -> token) in
     (match shared with
      | Some dir ->
@@ -315,7 +324,7 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
     |> List.for_each ~fn:(fun (i, (_, seat)) ->
       emit_attempt_started state ~request_id ~account:(seat_label seat);
       let pid = spawn (fun () -> send parent (Committee_answer (i, call_seat state config ~workspace ?shared ~body seat)); Ok ()) in
-      kids := pid :: !kids;
+      kids := (i, pid) :: !kids;
       ());
     let selector msg =
       match msg with
@@ -324,21 +333,45 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
       | _ -> Skip
     in
     (* Cloudflare drops a request that sends nothing for about two minutes.
-       A streamed committee writes a comment at least this often. *)
+       A streamed committee writes a comment at least this often. The same
+       wait also ends a seat that has used up [seat_limit]. *)
     let ping = ref (fun () -> ()) in
-    let rec await ~selector =
-      try receive ~selector ~timeout:(Time.Duration.from_secs 15) ()
-      with Receive_timeout ->
-        !ping ();
-        await ~selector
+    let rec await ~selector ~deadline_ms =
+      let left = deadline_ms - Oasis_signals.now_ms () in
+      if left <= 0 then `Expired
+      else
+        let slice = if left >= 15000 then 15 else max 1 ((left + 999) / 1000) in
+        try receive ~selector ~timeout:(Time.Duration.from_secs slice) ()
+        with Receive_timeout ->
+          let left = deadline_ms - Oasis_signals.now_ms () in
+          if left <= 0 then `Expired
+          else (
+            !ping ();
+            await ~selector ~deadline_ms)
     in
     let cancelled = ref None in
+    let expire_remaining acc =
+      List.enumerate seats
+      |> List.fold_left ~init:acc ~fn:(fun acc (i, (_, seat)) ->
+        if List.any acc ~fn:(fun (j, _) -> j = i) then acc
+        else (
+          (match List.find !kids ~fn:(fun (j, _) -> j = i) with
+           | Some (_, pid) -> send pid (Task_cancel ("seat:" ^ Int.to_string seat_limit))
+           | None -> ());
+          let name = seat_label seat in
+          emit_attempt_finished state ~request_id ~account:name ~status:None ~latency_ms:0 ~error:(Some seat_timeout_error);
+          broadcast_event state ~type_:"committee_member" ~request_id
+            ~data:(Json.obj [ ("account", Json.string name); ("ok", Json.bool false); ("error", Json.string seat_timeout_error) ]);
+          (i, Error seat_timeout_error) :: acc))
+    in
+    let member_deadline = Oasis_signals.now_ms () + (seat_limit * 1000) in
     let rec collect acc remaining =
       if remaining = 0 then acc
       else
-        match await ~selector with
+        match await ~selector ~deadline_ms:member_deadline with
+        | `Expired -> expire_remaining acc
         | `Cancel reason ->
-            List.for_each !kids ~fn:(fun pid -> send pid (Task_cancel reason));
+            List.for_each !kids ~fn:(fun (_, pid) -> send pid (Task_cancel reason));
             cancelled := Some reason;
             acc
         | `Answer (i, r) ->
@@ -421,13 +454,16 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
               | Ok (text, latency_ms) ->
                   emit_attempt_finished state ~request_id ~account:name ~status:(Some 200) ~latency_ms ~error:None;
                   Some (name, text)
-              | Error e when Option.is_some (cancel_reason_of e) ->
-                  emit_attempt_finished state ~request_id ~account:name ~status:None ~latency_ms:0 ~error:(Some e);
-                  cancelled := cancel_reason_of e;
-                  None
               | Error e ->
                   emit_attempt_finished state ~request_id ~account:name ~status:None ~latency_ms:0 ~error:(Some e);
-                  synthesize rest)
+                  (* A seat limit stops this summary. It is not a user cancel,
+                     and the next candidate would only hold the page again. *)
+                  match cancel_reason_of e with
+                  | Some reason when String.starts_with ~prefix:"seat:" reason -> None
+                  | Some reason ->
+                      cancelled := Some reason;
+                      None
+                  | None -> synthesize rest)
         in
         let parent = self () in
         let synth_pid =
@@ -441,9 +477,14 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
           | Task_cancel reason -> Select (`Cancel reason)
           | _ -> Skip
         in
+        let synth_expired = ref false in
         let summary =
-          match await ~selector:synth_selector with
+          match await ~selector:synth_selector ~deadline_ms:(Oasis_signals.now_ms () + (seat_limit * 1000)) with
           | `Synth s -> s
+          | `Expired ->
+              send synth_pid (Task_cancel ("seat:" ^ Int.to_string seat_limit));
+              synth_expired := true;
+              None
           | `Cancel reason ->
               send synth_pid (Task_cancel reason);
               cancelled := Some reason;
@@ -458,7 +499,11 @@ let handle = fun (state : state) (ctx : Trail.ctx) (body : Json.t) ~(members : s
           | Some (s, text) -> (s, "## 汇总（" ^ s ^ "）\n\n" ^ text ^ "\n\n---\n\n" ^ sections)
           | None ->
               let first = match answered with (name, _) :: _ -> name | [] -> "committee" in
-              (first, "（汇总失败：没有可用的汇总模型，以下为各家原文）\n\n" ^ sections)
+              let lead =
+                if !synth_expired then "（汇总超过席位时限，以下为各家原文）\n\n"
+                else "（汇总失败：没有可用的汇总模型，以下为各家原文）\n\n"
+              in
+              (first, lead ^ sections)
         in
         emit_task_done ~answer:content state ~request_id ~chosen:(Some chosen) ~attempts:(n + 1) ~ok:true;
         ( Net.Http.Status.Ok,
