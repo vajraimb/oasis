@@ -199,10 +199,11 @@ EMA 与样本数持久化到 `~/.oasis/data/latency.json`（每个 `task_done` �
   推理模型的 `reasoning_content`（OpenRouter 为 `reasoning`）不进回答，按 ~240 字一批作为 `agent_step`
   的 `thinking` 步骤推到控制台时间线。`max_tokens` 只转发客户端给的值，Oasis 自己不设上限（控制台、CLI、MCP 都不再默认填）；
   Anthropic 协议必须带该字段，客户端没给时用 KB 中该模型的 `max_output`
-- **流式（agent）**：子进程 stdout 逐行 → `Oasis_steps.parse` 把 claude / cursor-agent / gemini / kimi / grok
+- **流式（agent）**：子进程 stdout 逐行 → `Oasis_steps.parse` 把 claude / pie / cursor-agent / gemini / kimi / grok
   的 JSON 事件流解析成工作步骤（`thinking` / `text` / `tool` / `tool_result` / `usage`），非 JSON 行与未知 CLI
   按纯文本处理。只有 `text` 进入客户端 delta（末尾 `result` 是全文重复，丢弃；整条消息之间、工具调用后续写的
-  文字之间插空行）；思考与工具步骤**不进回答**，作为 `agent_step` 事件广播给控制台（§2.6）。
+  文字之间插空行；pie 的 `"delta": true` 文本片段粘在一起，不插空行）；思考与工具步骤**不进回答**，作为 `agent_step` 事件广播给控制台（§2.6）。
+  pie 退出码：0 成功，1 用法或启动失败，2 模型服务失败（记失败并回退），130（中断）和 143（SIGTERM）记为取消，不计入熔断、不换下一个 agent。
   心跳保活（10s 空 chunk）。标准输出和标准错误连续 120 秒没有任何字节时，视为进程已不再工作，杀掉进程树并记失败
   （grok 为 600 秒，它在两次输出之间会想比较久）。已经写出正文后再沉默，按已有回答收口，不记失败。这不是任务总时限：只要还在输出，就可以一直做下去。
   取消或（配置了 `timeout_s` 时）看门狗 SIGKILL：子进程由 perl 包装成为进程组组长，
@@ -283,7 +284,7 @@ agent 回答文字。路由说明与切换说明在服务端生成人话（"交�
   问答轮优先上一轮的账户，失败时照常回退。显式指定的头总是优先
 - **agent 会话续接**：agent 输出里的会话 id（`session_id` / `sessionId`，取最后一个）通过 `agent_session`
   事件记入对话。续接时用 `resume_args` 让 CLI 接着自己的会话，只把新的一句话作为 prompt；
-  默认 claude / cursor-agent / gemini / grok 为 `["--resume", "{session}"]`，kimi 为 `["--session", "{session}"]`，
+  默认 claude / cursor-agent / gemini / grok / pie 为 `["--resume", "{session}"]`，kimi 为 `["--session", "{session}"]`，
   可在 `[[agents]]` 里用 `resume_args` 覆盖。换了 agent 或没有会话 id 时退回到「历史文本 + 新问题」
 - **控制台**：任务列表按对话分组（一行一个对话，显示轮数；只在 `threads.json` 里的旧对话标「历史」），
   详情里有轮次切换、「对话 · n 轮」页签和底部续接输入框（显示这一轮会交给谁、是否续接 CLI 会话）；

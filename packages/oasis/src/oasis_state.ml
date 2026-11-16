@@ -43,7 +43,9 @@ let threads_file = fun (state : state) -> (Sync.Atomic.get state.config).Oasis_c
 (** [Task_cancel] reasons: "user" (stop button / API), "timeout:<secs>"
     (whole-task deadline from X-Oasis-Timeout), or "seat:<secs>" (one
     committee seat hit its limit; the rest of the committee continues).
-    A normal chat has no deadline unless the caller sets one. *)
+    Pie's own exits 130 and 143 are reported the same way, as "aborted" and
+    "sigterm", so they do not count as agent failures. A normal chat has no
+    deadline unless the caller sets one. *)
 let watch_task = fun (state : state) ?pid ~request_id () ->
   if not (String.is_empty request_id) then
     let pid = match pid with Some p -> p | None -> self () in
@@ -72,6 +74,8 @@ let cancel_reason_of = fun err ->
 let cancel_text = fun reason ->
   if String.starts_with ~prefix:"timeout:" reason then
     "超过调用方设定的时限（" ^ String.sub reason ~offset:8 ~len:(String.length reason - 8) ^ "s），已停止"
+  else if String.equal reason "aborted" then "这一轮被中断"
+  else if String.equal reason "sigterm" then "进程被终止"
   else "已手动停止"
 
 (** Arms the caller's X-Oasis-Timeout: cancels the task after [secs] if it

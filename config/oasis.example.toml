@@ -169,6 +169,20 @@ strengths = ["coding", "general"]
 latency = "slow"
 enabled = false
 
+# pie (https://github.com/vajraimb/pie-odin) headless. Oasis starts the process
+# with a clean environment, so --provider odinfer is required: no API key is
+# passed through, and the default base is http://127.0.0.1:11445. Replace both
+# paths. Shell stays denied. Use "--approve", "workspace-write" only where the
+# sandbox backend is real (Linux currently refuses the write).
+# pie 无头模式。Oasis 给子进程的是干净环境，必须写 --provider odinfer
+# （不会带上 API key，默认连 http://127.0.0.1:11445）。把下面两个路径换成自己的。
+# shell 始终拒绝。只有沙箱真正可用时才把 approve 改成 workspace-write。
+# [[agents]]
+# name = "pie"
+# command = "/ABS/PATH/TO/pie"
+# args = ["--provider", "odinfer", "--model", "ornith", "-p", "--output-format", "stream-json", "--approve", "read-only", "{prompt}"]
+# workdir = "/ABS/PATH/TO/project"
+
 # ---------------------------------------------------------------------------
 # Routes: which accounts may serve each category. / 每个类别允许哪些账户执行。
 # ---------------------------------------------------------------------------

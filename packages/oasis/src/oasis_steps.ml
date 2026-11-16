@@ -30,6 +30,9 @@ let str = fun j key -> Json.get_field key j |> Option.and_then ~fn:Json.get_stri
 
 let int_field = fun j key -> Json.get_field key j |> Option.and_then ~fn:Json.get_int
 
+let bool_field = fun j key ->
+  Json.get_field key j |> Option.and_then ~fn:Json.get_bool |> Option.unwrap_or ~default:false
+
 let step = fun kind fields -> Json.obj (("kind", Json.string kind) :: fields)
 
 let thinking = fun ?(delta = false) text ->
@@ -90,15 +93,20 @@ let tool_result = fun ~id ~ok ~output ->
       ("output", Json.string (clip (String.trim output) 1200));
     ]
 
-let usage = fun ?(turns = 0) ?(duration_ms = 0) ?(output_tokens = 0) ?(tool_calls = 0) () ->
-  step
-    "usage"
+let usage =
+  fun ?(turns = 0) ?(duration_ms = 0) ?(output_tokens = 0) ?(tool_calls = 0) ?(error = "") ?(stop = "") () ->
+  let fields =
     [
       ("turns", Json.int turns);
       ("duration_ms", Json.int duration_ms);
       ("output_tokens", Json.int output_tokens);
       ("tool_calls", Json.int tool_calls);
     ]
+  in
+  let fields = if String.is_empty stop then fields else fields @ [ ("stop_reason", Json.string stop) ] in
+  let err = String.trim error in
+  let fields = if String.is_empty err then fields else fields @ [ ("error", Json.string (clip err 400)) ] in
+  step "usage" fields
 
 (** Text of a tool-result payload: a string, or an array of text blocks. *)
 let content_text = fun (c : Json.t) ->
@@ -157,6 +165,61 @@ let parse_claude = fun j ->
           ~turns:(int_field j "num_turns" |> Option.unwrap_or ~default:0)
           ~duration_ms:(int_field j "duration_ms" |> Option.unwrap_or ~default:0)
           ~output_tokens:(out_tokens |> Option.unwrap_or ~default:0)
+          ();
+      ]
+  | _ -> []
+
+(** Pie headless stream-json (pie-odin). Same blocks as Claude, but assistant
+    text is a token fragment when [delta] is true. Those fragments must stay
+    deltas: a whole-message narration would put a blank line between tokens. *)
+let parse_pie = fun j ->
+  match str j "type" with
+  | Some "assistant" ->
+      List.filter_map (message_blocks j) ~fn:(fun b ->
+        match str b "type" with
+        | Some "thinking" -> (
+            match str b "thinking" with
+            | Some t when not (String.is_empty (String.trim t)) -> Some (thinking ~delta:(bool_field b "delta") t)
+            | _ -> None
+          )
+        | Some "text" -> (
+            match str b "text" with
+            | Some t when not (String.is_empty t) -> Some (narration ~delta:(bool_field b "delta") t)
+            | _ -> None
+          )
+        | Some "tool_use" ->
+            Some
+              (tool
+                ~id:(str b "id" |> Option.unwrap_or ~default:"")
+                ~name:(str b "name" |> Option.unwrap_or ~default:"tool")
+                ~input:(Json.get_field "input" b |> Option.unwrap_or ~default:Json.null))
+        | _ -> None)
+  | Some "user" ->
+      List.filter_map (message_blocks j) ~fn:(fun b ->
+        match str b "type" with
+        | Some "tool_result" ->
+            Some
+              (tool_result
+                ~id:(str b "tool_use_id" |> Option.unwrap_or ~default:"")
+                ~ok:(not (bool_field b "is_error"))
+                ~output:(Json.get_field "content" b |> Option.map ~fn:content_text |> Option.unwrap_or ~default:""))
+        | _ -> None)
+  | Some "result" ->
+      let out_tokens =
+        Json.get_field "usage" j |> Option.and_then ~fn:(fun u -> int_field u "output_tokens")
+      in
+      let err =
+        match str j "error" with
+        | Some e when not (String.is_empty (String.trim e)) -> String.trim e
+        | _ -> ""
+      in
+      [
+        usage
+          ~turns:(int_field j "num_turns" |> Option.unwrap_or ~default:0)
+          ~duration_ms:(int_field j "duration_ms" |> Option.unwrap_or ~default:0)
+          ~output_tokens:(out_tokens |> Option.unwrap_or ~default:0)
+          ~error:err
+          ~stop:(str j "stop_reason" |> Option.unwrap_or ~default:"")
           ();
       ]
   | _ -> []
@@ -402,6 +465,7 @@ let parse = fun ~command (line : string) ->
   let parser =
     match basename command with
     | "claude" -> Some parse_claude
+    | "pie" -> Some parse_pie
     | "cursor-agent" -> Some parse_cursor
     | "gemini" -> Some parse_gemini
     | "kimi" -> Some parse_kimi
@@ -428,9 +492,10 @@ let is_delta = fun s -> Json.get_field "delta" s |> Option.and_then ~fn:Json.get
 type joiner = {
   mutable started: bool;
   mutable broke: bool;
+  mutable detail: string;  (** last result-event error, for the exit line *)
 }
 
-let joiner = fun () -> { started = false; broke = false }
+let joiner = fun () -> { started = false; broke = false; detail = "" }
 
 let answer_piece = fun (jn : joiner) steps ->
   List.fold_left steps ~init:"" ~fn:(fun acc s ->
@@ -444,5 +509,10 @@ let answer_piece = fun (jn : joiner) steps ->
         acc ^ sep ^ t
     | "tool" | "tool_result" ->
         jn.broke <- true;
+        acc
+    | "usage" ->
+        (match str s "error" with
+         | Some e when not (String.is_empty (String.trim e)) -> jn.detail <- String.trim e
+         | _ -> ());
         acc
     | _ -> acc)

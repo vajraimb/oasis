@@ -310,6 +310,7 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
             candidates_left := rest;
             current := nm;
             joiner.Oasis_steps.broke <- true;
+            joiner.Oasis_steps.detail <- "";
             t0 := Time.Instant.now ();
             match find_agent config nm with
             | None ->
@@ -485,6 +486,30 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
             false
           )
         in
+        let finish_cancel = fun ?(kill = false) reason ->
+          finished := true;
+          (* A process that already exited (pie 130 / 143) must not be signaled
+             again: its pid may have been reused. A caller cancel still kills. *)
+          if kill then
+            match !proc with
+            | Some p -> ignore (Runtime.spawn_blocked (fun () -> Oasis_agent.kill_group p; Ok ()))
+            | None -> ();
+          release_slot ();
+          let err = cancel_error reason in
+          let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed !t0) in
+          attempts :=
+            { Oasis_router.account = !current; model = !current; status = None; error = Some err; latency_ms; cost_nano = 0 }
+            :: !attempts;
+          emit_attempt_finished state ~request_id ~account:!current ~status:None ~latency_ms ~error:(Some err);
+          record_decision state { decision with Oasis_router.attempts = List.rev !attempts };
+          emit_task_done ~cancelled:true ~error:(cancel_text reason) ~answer:!sent state ~request_id ~chosen:None
+            ~attempts:(List.length !attempts) ~ok:false;
+          let payload =
+            Json.obj [ ("error", Json.obj [ ("message", Json.string (cancel_text reason)); ("type", Json.string "oasis_cancelled") ]) ]
+          in
+          write_client ("data: " ^ Json.to_string payload ^ "\n\n");
+          write_client "data: [DONE]\n\n"
+        in
         let _ = start_agent () in
         let rec loop () =
           if not !finished then (
@@ -501,27 +526,7 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
             | `Spawned p ->
                 proc := Some p;
                 loop ()
-            | `Cancel reason ->
-                finished := true;
-                (match !proc with
-                 | Some p -> ignore (Runtime.spawn_blocked (fun () -> Oasis_agent.kill_group p; Ok ()))
-                 | None -> ());
-                release_slot ();
-                let err = cancel_error reason in
-                let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed !t0) in
-                attempts :=
-                  { Oasis_router.account = !current; model = !current; status = None; error = Some err; latency_ms; cost_nano = 0 }
-                  :: !attempts;
-                emit_attempt_finished state ~request_id ~account:!current ~status:None ~latency_ms ~error:(Some err);
-                record_decision state { decision with Oasis_router.attempts = List.rev !attempts };
-                emit_task_done ~cancelled:true ~error:(cancel_text reason) ~answer:!sent state ~request_id ~chosen:None
-                  ~attempts:(List.length !attempts) ~ok:false;
-                let payload =
-                  Json.obj [ ("error", Json.obj [ ("message", Json.string (cancel_text reason)); ("type", Json.string "oasis_cancelled") ]) ]
-                in
-                write_client ("data: " ^ Json.to_string payload ^ "\n\n");
-                write_client "data: [DONE]\n\n";
-                ()
+            | `Cancel reason -> finish_cancel ~kill:true reason
             | `Line line -> (
                 watch_session ~agent:!current line;
                 let text, steps =
@@ -541,26 +546,41 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
             | `Done (code, note) ->
                 finished := true;
                 let note = String.trim note in
+                let command =
+                  match find_agent config !current with Some a -> a.Oasis_agent.command | None -> ""
+                in
+                let timeout_s =
+                  match find_agent config !current with Some a -> a.Oasis_agent.timeout_s | None -> 0
+                in
                 let silent = String.is_empty (String.trim !sent) in
                 (* A zero exit with an empty answer and a short stderr note is
                    a failure: WorkBuddy does this when the CLI is not logged in.
                    A long note is the agent's own progress log, not the answer. *)
                 let brief = String.length note <= 240 in
-                let tail =
-                  if String.length note <= 400 then note
-                  else String.sub note ~offset:(String.length note - 400) ~len:400
-                in
-                if code = 0 && not (silent && not (String.is_empty note)) then finish_ok ()
-                else (
-                  if code = 0 && silent && brief then sent := note;
-                  let reason =
-                    if code = 0 && brief then note
-                    else if code = 0 then "agent 结束了这一轮，但没有给出回答"
-                    else
-                      let base = "agent exited with code " ^ Int.to_string code in
-                      if String.is_empty tail then base else base ^ ": " ^ tail
+                if code = 137 && timeout_s > 0 then (
+                  let tail =
+                    if String.length note <= 400 then note
+                    else String.sub note ~offset:(String.length note - 400) ~len:400
                   in
+                  let base = "agent timeout (" ^ Int.to_string timeout_s ^ "s)" in
+                  let reason = if String.is_empty tail then base else base ^ ": " ^ tail in
                   if finish_fail reason then loop ()
+                ) else (
+                  match
+                    Oasis_agent.classify_exit ~command ~code ~note ~detail:joiner.Oasis_steps.detail
+                  with
+                  | Oasis_agent.Exit_cancelled reason -> finish_cancel reason
+                  | Oasis_agent.Exit_failed msg ->
+                      if finish_fail msg then loop ()
+                  | Oasis_agent.Exit_ok ->
+                      if not (silent && not (String.is_empty note)) then finish_ok ()
+                      else (
+                        if silent && brief then sent := note;
+                        let reason =
+                          if brief then note else "agent 结束了这一轮，但没有给出回答"
+                        in
+                        if finish_fail reason then loop ()
+                      )
                 )
             | `Timeout ->
                 finished := true;
