@@ -94,7 +94,7 @@ let tool_result = fun ~id ~ok ~output ->
     ]
 
 let usage =
-  fun ?(turns = 0) ?(duration_ms = 0) ?(output_tokens = 0) ?(tool_calls = 0) ?(error = "") ?(stop = "") () ->
+  fun ?(turns = 0) ?(duration_ms = 0) ?(output_tokens = 0) ?(tool_calls = 0) ?(error = "") ?(stop = "") ?(subtype = "") () ->
   let fields =
     [
       ("turns", Json.int turns);
@@ -104,9 +104,14 @@ let usage =
     ]
   in
   let fields = if String.is_empty stop then fields else fields @ [ ("stop_reason", Json.string stop) ] in
+  let fields = if String.is_empty subtype then fields else fields @ [ ("subtype", Json.string subtype) ] in
   let err = String.trim error in
   let fields = if String.is_empty err then fields else fields @ [ ("error", Json.string (clip err 400)) ] in
   step "usage" fields
+
+(** Stdout from an attempt that did not become the answer. The timeline shows
+    it; the client delta and the task answer do not. *)
+let log_line = fun text -> step "log" [ ("text", Json.string (clip text 4000)) ]
 
 (** Text of a tool-result payload: a string, or an array of text blocks. *)
 let content_text = fun (c : Json.t) ->
@@ -220,6 +225,7 @@ let parse_pie = fun j ->
           ~output_tokens:(out_tokens |> Option.unwrap_or ~default:0)
           ~error:err
           ~stop:(str j "stop_reason" |> Option.unwrap_or ~default:"")
+          ~subtype:(str j "subtype" |> Option.unwrap_or ~default:"")
           ();
       ]
   | _ -> []
@@ -493,9 +499,11 @@ type joiner = {
   mutable started: bool;
   mutable broke: bool;
   mutable detail: string;  (** last result-event error, for the exit line *)
+  mutable stop: string;  (** last result stop_reason, empty if the run printed none *)
+  mutable subtype: string;  (** last result subtype (interrupted, sigterm, …) *)
 }
 
-let joiner = fun () -> { started = false; broke = false; detail = "" }
+let joiner = fun () -> { started = false; broke = false; detail = ""; stop = ""; subtype = "" }
 
 let answer_piece = fun (jn : joiner) steps ->
   List.fold_left steps ~init:"" ~fn:(fun acc s ->
@@ -513,6 +521,12 @@ let answer_piece = fun (jn : joiner) steps ->
     | "usage" ->
         (match str s "error" with
          | Some e when not (String.is_empty (String.trim e)) -> jn.detail <- String.trim e
+         | _ -> ());
+        (match str s "stop_reason" with
+         | Some v when not (String.is_empty v) -> jn.stop <- v
+         | _ -> ());
+        (match str s "subtype" with
+         | Some v when not (String.is_empty v) -> jn.subtype <- v
          | _ -> ());
         acc
     | _ -> acc)

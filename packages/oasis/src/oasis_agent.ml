@@ -653,10 +653,12 @@ let exit_code = fun ~proc ->
 
 (** How a finished process is reported. Pie headless: 0 finished, 1 usage or
     startup, 2 provider failed, 130 SIGINT or an aborted turn, 143 SIGTERM.
-    130 and 143 are cancellations ([Oasis_state.cancel_error] of the reason):
-    the agent is not at fault, so they must not trip the breaker or fall
-    through to the next candidate. Other CLIs keep the generic exit line.
-    [detail] is a result event's error text, when the CLI printed one. *)
+    Exit 130 and 143 are cancellations for every local agent (a signal death
+    is not the agent's fault). A result event with [stop] [aborted] or
+    [subtype] [interrupted] / [sigterm] is the same cancellation, even when
+    the process status is 0. Cancellations use [Oasis_state.cancel_error] of
+    the reason and must not trip the breaker or fall through. [detail] is a
+    result event's error text, when the CLI printed one. *)
 type exit_class =
   | Exit_ok
   | Exit_cancelled of string
@@ -667,14 +669,18 @@ let note_tail = fun s ->
   let n = String.length s in
   if n <= 400 then s else String.sub s ~offset:(n - 400) ~len:400
 
-let classify_exit = fun ~command ~code ~note ~detail ->
+let classify_exit = fun ~command ~code ~note ?(stop = "") ?(subtype = "") ~detail () ->
   let attach base =
     let note = note_tail note in
     let detail = String.trim detail in
     let base = if String.is_empty note then base else base ^ ": " ^ note in
     if String.is_empty detail then base else base ^ ": " ^ detail
   in
-  if code = 0 then Exit_ok
+  (* Signal exits and pie's aborted result are cancellations. The reason
+     stays a bare token so [cancel_text] can name it. *)
+  if code = 143 || String.equal subtype "sigterm" then Exit_cancelled "sigterm"
+  else if code = 130 || String.equal subtype "interrupted" || String.equal stop "aborted" then Exit_cancelled "aborted"
+  else if code = 0 then Exit_ok
   else if code = 137 then Exit_failed (attach "agent killed (SIGKILL)")
   else
     match Oasis_steps.basename command with
@@ -682,8 +688,6 @@ let classify_exit = fun ~command ~code ~note ~detail ->
         match code with
         | 1 -> Exit_failed (attach "pie usage or startup failed")
         | 2 -> Exit_failed (attach "pie provider failed")
-        | 130 -> Exit_cancelled "aborted"
-        | 143 -> Exit_cancelled "sigterm"
         | n when n < 0 -> Exit_failed (attach ("agent exited with code " ^ Int.to_string n))
         | n -> Exit_failed (attach ("pie exited with code " ^ Int.to_string n))
       )
@@ -745,7 +749,10 @@ let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn 
                 if code = 137 && agent.timeout_s > 0 then
                   Error (with_note ("agent timeout (" ^ Int.to_string agent.timeout_s ^ "s)"))
                 else
-                  match classify_exit ~command:agent.command ~code ~note ~detail with
+                  match
+                    classify_exit ~command:agent.command ~code ~note ~detail
+                      ~stop:jn.Oasis_steps.stop ~subtype:jn.Oasis_steps.subtype ()
+                  with
                   | Exit_cancelled reason -> Error ("cancelled:" ^ reason)
                   | Exit_failed msg -> Error msg
                   | Exit_ok ->

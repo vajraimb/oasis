@@ -1,0 +1,25 @@
+#!/bin/sh
+# Stand-in for pie headless. The first argument selects the run.
+mode="$1"
+case "$mode" in
+  interrupted)
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-int"}'
+    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial","delta":true}]},"session_id":"s-int"}'
+    printf '%s\n' '{"type":"result","subtype":"interrupted","is_error":true,"stop_reason":"aborted","result":"partial","error":"interrupted","duration_ms":12,"num_turns":1,"session_id":"s-int","usage":{"input_tokens":1,"output_tokens":1}}'
+    exit 130
+    ;;
+  sigterm)
+    printf '%s\n' '{"type":"result","subtype":"sigterm","is_error":true,"stop_reason":"aborted","result":"","error":"interrupted","duration_ms":3,"num_turns":0,"session_id":"s-term","usage":{"input_tokens":0,"output_tokens":0}}'
+    exit 143
+    ;;
+  dead)
+    printf '%s\n' '{"error":"dial tcp 127.0.0.1:11445: connect: connection refused"}'
+    printf '%s\n' 'provider ndjson {"error":"upstream closed"}'
+    printf '%s\n' '{"type":"result","subtype":"error","is_error":true,"stop_reason":"error","result":"","error":"model request failed","duration_ms":8,"num_turns":0,"session_id":"s-dead","usage":{"input_tokens":0,"output_tokens":0}}'
+    exit 2
+    ;;
+  *)
+    echo "unknown pie mode"
+    exit 1
+    ;;
+esac

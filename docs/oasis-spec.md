@@ -203,7 +203,7 @@ EMA 与样本数持久化到 `~/.oasis/data/latency.json`（每个 `task_done` �
   的 JSON 事件流解析成工作步骤（`thinking` / `text` / `tool` / `tool_result` / `usage`），非 JSON 行与未知 CLI
   按纯文本处理。只有 `text` 进入客户端 delta（末尾 `result` 是全文重复，丢弃；整条消息之间、工具调用后续写的
   文字之间插空行；pie 的 `"delta": true` 文本片段粘在一起，不插空行）；思考与工具步骤**不进回答**，作为 `agent_step` 事件广播给控制台（§2.6）。
-  pie 退出码：0 成功，1 用法或启动失败，2 模型服务失败（记失败并回退），130（中断）和 143（SIGTERM）记为取消，不计入熔断、不换下一个 agent。
+  pie 退出码：0 成功，1 用法或启动失败，2 模型服务失败（记失败并回退），130（中断）和 143（SIGTERM）记为取消，不计入熔断、不换下一个 agent。任何本地 agent 的 130/143，以及 result 事件的 `stop_reason=aborted` 或 `subtype=interrupted`/`sigterm`，同样收成取消：流式响应先写出 `oasis_cancelled` 再 `[DONE]`，任务状态变为 `cancelled`（不再停在 `running`）。`POST /api/feed/cancel` 对所有本地 agent 走同一条路。失败后换下一个 agent 时，失败那一次的 stdout 不进入客户端 delta，也不进入任务回答，只作为时间线上的 `log` 诊断步骤。
   心跳保活（10s 空 chunk）。标准输出和标准错误连续 120 秒没有任何字节时，视为进程已不再工作，杀掉进程树并记失败
   （grok 为 600 秒，它在两次输出之间会想比较久）。已经写出正文后再沉默，按已有回答收口，不记失败。这不是任务总时限：只要还在输出，就可以一直做下去。
   取消或（配置了 `timeout_s` 时）看门狗 SIGKILL：子进程由 perl 包装成为进程组组长，
