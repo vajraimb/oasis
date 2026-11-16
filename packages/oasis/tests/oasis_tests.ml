@@ -1824,6 +1824,150 @@ let test_steps_answer_join = fun _ctx ->
   Test.assert_equal ~expected:"a\nb\n" ~actual:(run ~command:"opencode" [ "a"; ""; "b" ]);
   Ok ()
 
+let test_pie_stream_and_resume = fun _ctx ->
+  let path = Agent.absolute "./packages/oasis/tests/fixtures/pie_stream.ndjson" in
+  let text =
+    match Fs.read_to_string (Path.from_string path |> Result.unwrap) with
+    | Ok s -> s
+    | Error _ -> ""
+  in
+  if String.is_empty text then Error "missing pie_stream.ndjson"
+  else
+    let groups =
+      let rec go acc cur lines =
+        match lines with
+        | [] -> List.rev (if List.is_empty cur then acc else List.rev cur :: acc)
+        | "" :: rest ->
+            let acc = if List.is_empty cur then acc else List.rev cur :: acc in
+            go acc [] rest
+        | line :: rest -> go acc (line :: cur) rest
+      in
+      go [] [] (String.split ~by:"\n" text |> List.map ~fn:String.trim)
+    in
+    let play lines =
+      let jn = Steps.joiner () in
+      let steps = ref [] in
+      let answer =
+        List.fold_left lines ~init:"" ~fn:(fun acc line ->
+          let piece, ss = Agent.consume_line jn ~command:"/usr/local/bin/pie" line in
+          steps := !steps @ ss;
+          acc ^ piece)
+      in
+      (answer, !steps, jn)
+    in
+    match groups with
+    | [ ok_run; aborted; failed; denied ] ->
+        let answer, steps, jn = play ok_run in
+        Test.assert_equal ~expected:(Some "s1") ~actual:(Agent.session_id_of_line (List.get_unchecked ok_run ~at:0));
+        Test.assert_equal ~expected:None ~actual:(Agent.extract_text ~command:"pie" (List.get_unchecked ok_run ~at:0));
+        Test.assert_equal
+          ~expected:None
+          ~actual:(Agent.extract_text ~command:"pie" (List.get_unchecked ok_run ~at:(List.length ok_run - 1)));
+        Test.assert_equal ~expected:"Hello\n\nDone" ~actual:answer;
+        Test.assert_equal
+          ~expected:[ "thinking"; "text"; "text"; "tool"; "tool_result"; "text"; "usage" ]
+          ~actual:(kinds steps);
+        Test.assert_equal ~expected:true ~actual:(Steps.is_delta (List.get_unchecked steps ~at:1));
+        Test.assert_equal ~expected:true ~actual:(Steps.is_delta (List.get_unchecked steps ~at:2));
+        Test.assert_equal ~expected:"look" ~actual:(sfield (List.get_unchecked steps ~at:0) "text");
+        Test.assert_equal ~expected:"read_file" ~actual:(sfield (List.get_unchecked steps ~at:3) "name");
+        Test.assert_equal ~expected:"a.txt" ~actual:(sfield (List.get_unchecked steps ~at:3) "input");
+        Test.assert_equal ~expected:"call_1" ~actual:(sfield (List.get_unchecked steps ~at:3) "id");
+        Test.assert_equal
+          ~expected:(Some true)
+          ~actual:(Json.get_field "ok" (List.get_unchecked steps ~at:4) |> Option.and_then ~fn:Json.get_bool);
+        Test.assert_equal ~expected:"file body" ~actual:(sfield (List.get_unchecked steps ~at:4) "output");
+        Test.assert_equal ~expected:"stop" ~actual:(sfield (List.get_unchecked steps ~at:6) "stop_reason");
+        Test.assert_equal ~expected:(Some 2) ~actual:(Steps.int_field (List.get_unchecked steps ~at:6) "turns");
+        Test.assert_equal ~expected:"" ~actual:jn.Steps.detail;
+        let answer, steps, jn = play aborted in
+        Test.assert_equal ~expected:"partial" ~actual:answer;
+        Test.assert_equal ~expected:"aborted" ~actual:(sfield (List.get_unchecked steps ~at:(List.length steps - 1)) "stop_reason");
+        Test.assert_equal ~expected:"interrupted" ~actual:(sfield (List.get_unchecked steps ~at:(List.length steps - 1)) "error");
+        Test.assert_equal ~expected:"interrupted" ~actual:jn.Steps.detail;
+        Test.assert_equal ~expected:"aborted" ~actual:jn.Steps.stop;
+        Test.assert_equal ~expected:"error" ~actual:jn.Steps.subtype;
+        Test.assert_equal
+          ~expected:(Agent.Exit_cancelled "aborted")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:0 ~note:"" ~detail:jn.Steps.detail ~stop:jn.Steps.stop ~subtype:jn.Steps.subtype ());
+        let answer, steps, jn = play failed in
+        Test.assert_equal ~expected:"" ~actual:answer;
+        Test.assert_equal ~expected:[ "usage" ] ~actual:(kinds steps);
+        Test.assert_equal ~expected:"error" ~actual:(sfield (List.get_unchecked steps ~at:0) "stop_reason");
+        Test.assert_equal ~expected:"model request failed" ~actual:jn.Steps.detail;
+        let _, steps, _ = play denied in
+        Test.assert_equal ~expected:[ "tool_result" ] ~actual:(kinds steps);
+        Test.assert_equal
+          ~expected:(Some false)
+          ~actual:(Json.get_field "ok" (List.get_unchecked steps ~at:0) |> Option.and_then ~fn:Json.get_bool);
+        Test.assert_equal ~expected:"refused: mutating tool denied" ~actual:(sfield (List.get_unchecked steps ~at:0) "output");
+        Test.assert_equal ~expected:(Some "plain\n") ~actual:(Agent.extract_text ~command:"pie" "plain");
+        let agent =
+          mk_agent
+            ~command:"/ABS/PATH/TO/pie"
+            ~args:
+              [
+                "--provider"; "odinfer"; "--model"; "ornith"; "-p"; "--output-format"; "stream-json"; "--approve";
+                "read-only"; "{prompt}";
+              ]
+            "pie"
+        in
+        let resumed =
+          match Agent.with_resume agent ~session:"sess-1" with
+          | None -> []
+          | Some a -> a.Agent.args_template
+        in
+        Test.assert_equal
+          ~expected:
+            [
+              "--resume"; "sess-1"; "--provider"; "odinfer"; "--model"; "ornith"; "-p"; "--output-format"; "stream-json";
+              "--approve"; "read-only"; "{prompt}";
+            ]
+          ~actual:resumed;
+        Test.assert_equal ~expected:Agent.Exit_ok ~actual:(Agent.classify_exit ~command:"pie" ~code:0 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_failed "pie usage or startup failed")
+          ~actual:(Agent.classify_exit ~command:"/opt/pie" ~code:1 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_failed "pie provider failed: down: model request failed")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:2 ~note:"down" ~detail:"model request failed" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_cancelled "aborted")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:130 ~note:"interrupted" ~detail:"interrupted" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_cancelled "sigterm")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:143 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_failed "pie exited with code 9")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:9 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_failed "agent killed (SIGKILL)")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:137 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_failed "agent exited with code -1")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:(-1) ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_failed "agent exited with code 2")
+          ~actual:(Agent.classify_exit ~command:"claude" ~code:2 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_cancelled "aborted")
+          ~actual:(Agent.classify_exit ~command:"claude" ~code:130 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_cancelled "sigterm")
+          ~actual:(Agent.classify_exit ~command:"/usr/local/bin/codex" ~code:143 ~note:"" ~detail:"" ());
+        Test.assert_equal
+          ~expected:(Agent.Exit_cancelled "sigterm")
+          ~actual:(Agent.classify_exit ~command:"pie" ~code:0 ~note:"" ~detail:"" ~stop:"aborted" ~subtype:"sigterm" ());
+        Test.assert_equal ~expected:"这一轮被中断" ~actual:(Feed.error_text "cancelled:aborted");
+        Test.assert_equal ~expected:"进程被终止" ~actual:(Feed.error_text "cancelled:sigterm");
+        Test.assert_equal ~expected:"已手动停止" ~actual:(Feed.error_text "cancelled:user");
+        Test.assert_equal
+          ~expected:"pie 没能启动：参数不对，或没写 --provider（Oasis 给子进程的是干净环境）"
+          ~actual:(Feed.error_text "pie usage or startup failed");
+        Test.assert_equal ~expected:"pie 的模型服务失败" ~actual:(Feed.error_text "pie provider failed: down");
+        Ok ()
+    | other -> Error ("expected 4 pie fixture runs, got " ^ Int.to_string (List.length other))
+
 let test_steps_clip_utf8 = fun _ctx ->
   Test.assert_equal ~expected:"你…" ~actual:(Steps.clip "你好" 4);
   Test.assert_equal ~expected:"abc" ~actual:(Steps.clip "abc" 5);
@@ -4770,6 +4914,177 @@ let test_agent_idle_after_answer_closes = fun _ctx ->
       Test.assert_equal ~expected:true ~actual:(Time.Duration.to_millis (Time.Instant.elapsed t0) < 8000);
       Ok ()
 
+type Message.t += Gateway_stream of (int * string, string) result
+
+let stream_body = fun text ->
+  Json.to_string
+    (Json.obj
+      [
+        ("stream", Json.bool true);
+        ("messages", Json.array [ Json.obj [ ("role", Json.string "user"); ("content", Json.string text) ] ]);
+      ])
+
+let task_id_of = fun feed ->
+  Json.from_string feed |> Result.to_option
+  |> Option.and_then ~fn:(Json.get_field "tasks")
+  |> Option.and_then ~fn:Json.get_array
+  |> Option.and_then ~fn:List.head
+  |> Option.and_then ~fn:(fun t -> Json.get_field "id" t)
+  |> Option.and_then ~fn:Json.get_string
+
+(** Cancelling a live local agent (not just pie) must end the SSE stream with
+    the same cancelled terminal accounts use, and the feed must leave `running`.
+    A second agent is armed so a mis-classified kill would fall through. *)
+let test_gateway_stream_cancel_local_agent = fun _ctx ->
+  let config =
+    mk_config_agents
+      ~accounts:[ mk_account "acc_api" ]
+      ~agents:
+        [
+          mk_agent ~command:"/bin/sh" ~args:[ "-c"; "sleep 30" ] ~timeout_s:0 ~tier:5 "agent_slow";
+          mk_agent ~args:[ fix "agent_ok.sh" ] ~tier:1 "agent_next";
+        ]
+      ~kb:[ mk_kb_model "m-x" ]
+      ~routes:[]
+      ~max_fallback:1
+  in
+  match Gateway.start ~config_path:None ~config ~port:0 () with
+  | Error e -> Error ("gateway: " ^ e)
+  | Ok gw ->
+      let me = self () in
+      let headers = [ ("Content-Type", "application/json"); ("X-Oasis-Category", "coding") ] in
+      let _ =
+        Runtime.spawn_blocked (fun () ->
+          let res =
+            match gw_stream_collect ~port:gw.port ~path:"/v1/chat/completions" ~headers ~body:(stream_body "q") with
+            | Error e -> Error e
+            | Ok (status, _, raw) -> Ok (status, raw)
+          in
+          send me (Gateway_stream res);
+          Ok ())
+      in
+      let rec cancel n =
+        if n <= 0 then Error "task did not stay cancellable"
+        else
+          match gw_get ~port:gw.port ~path:"/api/feed?limit=1" with
+          | Error e -> Error e
+          | Ok (_, feed) -> (
+              match task_id_of feed with
+              | None ->
+                  sleep (Time.Duration.from_millis 40);
+                  cancel (n - 1)
+              | Some id -> (
+                  match
+                    gw_post ~port:gw.port ~path:"/api/feed/cancel" ~headers:[ ("Content-Type", "application/json") ]
+                      ~body:(Json.to_string (Json.obj [ ("id", Json.string id) ]))
+                  with
+                  | Error e -> Error e
+                  | Ok (200, _) -> Ok id
+                  | Ok (404, _) ->
+                      sleep (Time.Duration.from_millis 40);
+                      cancel (n - 1)
+                  | Ok (st, body) -> Error ("cancel " ^ Int.to_string st ^ " " ^ body)
+                )
+            )
+      in
+      match cancel 80 with
+      | Error e -> Error e
+      | Ok id -> (
+          let selector msg = match msg with Gateway_stream r -> Select r | _ -> Skip in
+          match receive ~selector ~timeout:(Time.Duration.from_secs 15) () with
+          | exception Receive_timeout -> Error "stream did not end after cancel"
+          | Error e -> Error e
+          | Ok (status, raw) -> (
+              Test.assert_equal ~expected:200 ~actual:status;
+              Test.assert_equal ~expected:true ~actual:(String.contains raw "oasis_cancelled");
+              Test.assert_equal ~expected:true ~actual:(String.contains raw "[DONE]");
+              Test.assert_equal ~expected:false ~actual:(String.contains raw "hello from fake agent");
+              match gw_get ~port:gw.port ~path:("/api/feed/task?id=" ^ id) with
+              | Error e -> Error e
+              | Ok (_, task) ->
+                  Test.assert_equal ~expected:true ~actual:(String.contains task "\"status\":\"cancelled\"");
+                  Ok ()
+            )
+        )
+
+(** Pie exit 130/143 (result subtype interrupted/sigterm, stop_reason aborted)
+    finalizes as cancelled and does not fall through. Exit 2 falls through,
+    and the failed attempt's raw NDJSON stays out of the answer. *)
+let test_gateway_pie_cancel_and_fallback = fun _ctx ->
+  let pie = fix "pie" in
+  let config_of mode =
+    mk_config_agents
+      ~accounts:[ mk_account "acc_api" ]
+      ~agents:
+        [
+          mk_agent ~command:pie ~args:[ mode; "{prompt}" ] ~timeout_s:0 ~tier:5 "pie";
+          mk_agent ~args:[ fix "agent_ok.sh" ] ~tier:1 "agent_next";
+        ]
+      ~kb:[ mk_kb_model "m-x" ]
+      ~routes:[]
+      ~max_fallback:1
+  in
+  let post config =
+    match Gateway.start ~config_path:None ~config ~port:0 () with
+    | Error e -> Error e
+    | Ok gw -> (
+        let headers = [ ("Content-Type", "application/json"); ("X-Oasis-Category", "coding") ] in
+        match gw_stream_collect ~port:gw.port ~path:"/v1/chat/completions" ~headers ~body:(stream_body "q") with
+        | Error e -> Error e
+        | Ok (status, _, raw) -> (
+            match gw_get ~port:gw.port ~path:"/api/feed?limit=1" with
+            | Error e -> Error e
+            | Ok (_, feed) -> (
+                match task_id_of feed with
+                | None -> Error ("no task: " ^ feed)
+                | Some id -> (
+                    match gw_get ~port:gw.port ~path:("/api/feed/task?id=" ^ id) with
+                    | Error e -> Error e
+                    | Ok (_, task) -> Ok (status, raw, task)
+                  )
+              )
+          )
+      )
+  in
+  match post (config_of "interrupted") with
+  | Error e -> Error e
+  | Ok (status, raw, task) -> (
+      Test.assert_equal ~expected:200 ~actual:status;
+      Test.assert_equal ~expected:true ~actual:(String.contains raw "oasis_cancelled");
+      Test.assert_equal ~expected:true ~actual:(String.contains raw "partial");
+      Test.assert_equal ~expected:false ~actual:(String.contains raw "hello from fake agent");
+      Test.assert_equal ~expected:true ~actual:(String.contains task "\"status\":\"cancelled\"");
+      match post (config_of "sigterm") with
+      | Error e -> Error e
+      | Ok (status2, raw2, task2) -> (
+          Test.assert_equal ~expected:200 ~actual:status2;
+          Test.assert_equal ~expected:true ~actual:(String.contains raw2 "oasis_cancelled");
+          Test.assert_equal ~expected:false ~actual:(String.contains raw2 "hello from fake agent");
+          Test.assert_equal ~expected:true ~actual:(String.contains task2 "\"status\":\"cancelled\"");
+          match post (config_of "dead") with
+          | Error e -> Error e
+          | Ok (status3, raw3, task3) ->
+              Test.assert_equal ~expected:200 ~actual:status3;
+              Test.assert_equal ~expected:true ~actual:(String.contains raw3 "hello from fake agent");
+              Test.assert_equal ~expected:false ~actual:(String.contains raw3 "dial tcp");
+              Test.assert_equal ~expected:false ~actual:(String.contains raw3 "upstream closed");
+              Test.assert_equal ~expected:false ~actual:(String.contains raw3 "model request failed");
+              Test.assert_equal ~expected:false ~actual:(String.contains raw3 "oasis_cancelled");
+              let answer =
+                Json.from_string task3 |> Result.to_option
+                |> Option.and_then ~fn:(Json.get_field "answer")
+                |> Option.and_then ~fn:Json.get_string
+                |> Option.unwrap_or ~default:""
+              in
+              Test.assert_equal ~expected:false ~actual:(String.contains answer "dial tcp");
+              Test.assert_equal ~expected:false ~actual:(String.contains answer "upstream closed");
+              Test.assert_equal ~expected:true ~actual:(String.contains answer "hello from fake agent");
+              Test.assert_equal ~expected:true ~actual:(String.contains task3 "dial tcp");
+              Test.assert_equal ~expected:true ~actual:(String.contains task3 "\"status\":\"ok\"");
+              Ok ()
+        )
+    )
+
 let tests =
   Test.[
     case "chunked decoding: single chunk" test_chunked_single_chunk;
@@ -4812,6 +5127,7 @@ let tests =
     case "agent: args template" test_agent_build_args;
     case "agent: codex resume keeps exec flags" test_codex_resume_args;
     case "agent: deepseek resume follows the profile" test_dsh_resume_args;
+    case "agent: pie stream-json, exit codes and resume" test_pie_stream_and_resume;
     case "activity: deepseek turn closed" test_dsh_turn_closed;
     case "agent: claude stream-json parse" test_agent_claude_stream_json_parse;
     case "agent: cursor stream-json parse" test_agent_cursor_stream_json_parse;
@@ -4841,6 +5157,8 @@ let tests =
     case ~size:Test.Large "gateway: thread follow-up resumes the agent session" test_gateway_thread_resumes_agent_session;
     case ~size:Test.Large "gateway: caller deadline cancels account calls without failover" test_gateway_client_deadline_accounts;
     case ~size:Test.Large "gateway: agents run until cancelled" test_gateway_agent_runs_until_cancelled;
+    case ~size:Test.Large "gateway: cancelling a local agent ends the stream" test_gateway_stream_cancel_local_agent;
+    case ~size:Test.Large "gateway: pie cancel finalizes and exit 2 does not leak" test_gateway_pie_cancel_and_fallback;
     case "router: exploration promotes the least-measured" test_router_explore;
     case "judge: verdict and spec parsing" test_judge_parse;
     case "feed: ratings, review and final answer" test_feed_ratings_and_answer;

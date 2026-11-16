@@ -1327,7 +1327,8 @@ function renderTimeline(d) {
             '<pre class="out">' + (r ? esc(r.output || '（无输出）') : '执行中…') + '</pre></div>');
         } else if (e.step === 'tool_result') {
           if (!e.id || !toolIds.has(e.id)) row(e.ok ? '' : 'bad', e, '↳', '<span class="lbl">工具结果</span><div class="err-raw">' + esc(e.output) + '</div>');
-        } else if (e.step === 'usage') {
+        } else if (e.step === 'log') row('bad', e, '!', '<span class="lbl">诊断</span>' + ag + '<div class="err-raw">' + esc(e.text || '') + '</div>');
+        else if (e.step === 'usage') {
           const bits = [];
           if (e.turns) bits.push(e.turns + ' 轮');
           if (e.tool_calls) bits.push(e.tool_calls + ' 次工具');

@@ -148,6 +148,8 @@ let error_text = fun (err : string) ->
   let e = String.lowercase_ascii err in
   let has s = String.contains e s in
   if String.starts_with ~prefix:"cancelled:timeout" e then "到了调用方设定的时限，已停止"
+  else if String.starts_with ~prefix:"cancelled:aborted" e then "这一轮被中断"
+  else if String.starts_with ~prefix:"cancelled:sigterm" e then "进程被终止"
   else if String.starts_with ~prefix:"cancelled:" e then "已手动停止"
   else if has "upstream_stream_timeout" then "上游连接 120 秒没有任何数据，判定断线"
   else if has "empty_answer_reasoning_exhausted" then
@@ -159,6 +161,10 @@ let error_text = fun (err : string) ->
     "WorkBuddy 桌面版的登录是加密的，单独拉起的命令行解不开。先打开 WorkBuddy 桌面应用，Oasis 会走它已经登好的账号"
   else if has "one-shot runner does not compose" then
     "这条会话是 DeepSeek 桌面端开的，命令行接不进去。请在 DeepSeek 窗口里回复"
+  else if has "pie usage or startup" then
+    "pie 没能启动：参数不对，或没写 --provider（Oasis 给子进程的是干净环境）"
+  else if has "pie provider failed" then "pie 的模型服务失败"
+  else if has "pie exited with code" then "pie 异常退出（" ^ err ^ "）"
   else if has "exited with code" then
     "进程异常退出（" ^ err ^ "）——多半是 CLI 未登录、参数不兼容或自身报错"
   else if has "agent idle" then "进程还在，但持续没有任何输出，已停止"

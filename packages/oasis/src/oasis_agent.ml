@@ -69,10 +69,10 @@ let command_name = fun (a : agent) ->
   match List.rev (String.split_on_char '/' a.command) with n :: _ -> n | [] -> a.command
 
 (** How each known CLI resumes a session by id (verified with claude 2.x,
-    cursor-agent, gemini, grok; kimi per its help). *)
+    cursor-agent, gemini, grok; kimi per its help; pie headless `--resume`). *)
 let default_resume_args = fun name ->
   match name with
-  | "claude" | "cursor-agent" | "gemini" | "grok" | "codebuddy" -> [ "--resume"; "{session}" ]
+  | "claude" | "cursor-agent" | "gemini" | "grok" | "codebuddy" | "pie" -> [ "--resume"; "{session}" ]
   | "kimi" -> [ "--session"; "{session}" ]
   | "zcode.cjs" -> [ "--resume"; "{session}" ]
   | "dsh" -> [ "--session-id"; "{session}" ]
@@ -118,7 +118,7 @@ let with_resume = fun (a : agent) ~session ->
     )
 
 (** The CLI session id a stdout line announces ([session_id] for claude,
-    cursor-agent, gemini; [sessionId] for grok). *)
+    cursor-agent, gemini, pie; [sessionId] for grok). *)
 let session_id_of_line = fun (line : string) ->
   if not (String.contains line "ession") then None
   else
@@ -651,6 +651,48 @@ let exit_code = fun ~proc ->
   | Ok (Some (Process.Signaled s)) -> 128 + s
   | _ -> -1
 
+(** How a finished process is reported. Pie headless: 0 finished, 1 usage or
+    startup, 2 provider failed, 130 SIGINT or an aborted turn, 143 SIGTERM.
+    Exit 130 and 143 are cancellations for every local agent (a signal death
+    is not the agent's fault). A result event with [stop] [aborted] or
+    [subtype] [interrupted] / [sigterm] is the same cancellation, even when
+    the process status is 0. Cancellations use [Oasis_state.cancel_error] of
+    the reason and must not trip the breaker or fall through. [detail] is a
+    result event's error text, when the CLI printed one. *)
+type exit_class =
+  | Exit_ok
+  | Exit_cancelled of string
+  | Exit_failed of string
+
+let note_tail = fun s ->
+  let s = String.trim s in
+  let n = String.length s in
+  if n <= 400 then s else String.sub s ~offset:(n - 400) ~len:400
+
+let classify_exit = fun ~command ~code ~note ?(stop = "") ?(subtype = "") ~detail () ->
+  let attach base =
+    let note = note_tail note in
+    let detail = String.trim detail in
+    let base = if String.is_empty note then base else base ^ ": " ^ note in
+    if String.is_empty detail then base else base ^ ": " ^ detail
+  in
+  (* Signal exits and pie's aborted result are cancellations. The reason
+     stays a bare token so [cancel_text] can name it. *)
+  if code = 143 || String.equal subtype "sigterm" then Exit_cancelled "sigterm"
+  else if code = 130 || String.equal subtype "interrupted" || String.equal stop "aborted" then Exit_cancelled "aborted"
+  else if code = 0 then Exit_ok
+  else if code = 137 then Exit_failed (attach "agent killed (SIGKILL)")
+  else
+    match Oasis_steps.basename command with
+    | "pie" -> (
+        match code with
+        | 1 -> Exit_failed (attach "pie usage or startup failed")
+        | 2 -> Exit_failed (attach "pie provider failed")
+        | n when n < 0 -> Exit_failed (attach ("agent exited with code " ^ Int.to_string n))
+        | n -> Exit_failed (attach ("pie exited with code " ^ Int.to_string n))
+      )
+    | _ -> Exit_failed (attach ("agent exited with code " ^ Int.to_string code))
+
 (** Synchronous collection; call ONLY from a blocking lane. [on_line] sees
     every raw stdout line (for step extraction by the caller). *)
 let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn = fun (_ : Process.t) -> ()) ~(agent : agent) ~model ~prompt () ->
@@ -686,6 +728,7 @@ let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn 
         in
         let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
         let code = exit_code ~proc in
+        let detail = jn.Oasis_steps.detail in
         reap_close proc;
         if retry_bundle ~extra ~code ~note then launch lite_retry
         else
@@ -703,14 +746,20 @@ let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn 
             match why with
             | Idle -> Error (with_note ("agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"))
             | Turn_finished | Process_exit ->
-                (* WorkBuddy reports "not logged in" on stderr and still exits 0. *)
-                if code = 0 && not (String.is_empty (String.trim !buf)) then Ok !buf
-                else if code = 0 && not (String.is_empty note) then Error note
-                else if code = 0 then Ok !buf
-                else if code = 137 && agent.timeout_s > 0 then
+                if code = 137 && agent.timeout_s > 0 then
                   Error (with_note ("agent timeout (" ^ Int.to_string agent.timeout_s ^ "s)"))
-                else if code = 137 then Error (with_note "agent killed (SIGKILL)")
-                else Error (with_note ("agent exited with code " ^ Int.to_string code))
+                else
+                  match
+                    classify_exit ~command:agent.command ~code ~note ~detail
+                      ~stop:jn.Oasis_steps.stop ~subtype:jn.Oasis_steps.subtype ()
+                  with
+                  | Exit_cancelled reason -> Error ("cancelled:" ^ reason)
+                  | Exit_failed msg -> Error msg
+                  | Exit_ok ->
+                      (* WorkBuddy reports "not logged in" on stderr and still exits 0. *)
+                      if not (String.is_empty (String.trim !buf)) then Ok !buf
+                      else if not (String.is_empty note) then Error note
+                      else Ok !buf
   in
   launch []
 

@@ -309,7 +309,11 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
         | nm :: rest -> (
             candidates_left := rest;
             current := nm;
-            joiner.Oasis_steps.broke <- true;
+            joiner.Oasis_steps.started <- false;
+            joiner.Oasis_steps.broke <- false;
+            joiner.Oasis_steps.detail <- "";
+            joiner.Oasis_steps.stop <- "";
+            joiner.Oasis_steps.subtype <- "";
             t0 := Time.Instant.now ();
             match find_agent config nm with
             | None ->
@@ -393,7 +397,40 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
             ()
           )
         in
+        (* Answer text stays here until the attempt succeeds. A failed
+           attempt's stdout is a timeline diagnostic, not part of the answer
+           the client or the next agent sees. [raw] is every line, including
+           JSON that parsed as bookkeeping. *)
+        let pending = ref "" in
+        let pending_steps = ref [] in
+        let raw = ref "" in
+        let closed = ref false in
+        let emit_log text =
+          let text = String.trim text in
+          if not (String.is_empty text) then
+            emit_agent_step state ~request_id ~agent:!current (Oasis_steps.log_line text)
+        in
+        let commit_pending () =
+          let text = !pending in
+          let steps = !pending_steps in
+          pending := "";
+          pending_steps := [];
+          raw := "";
+          List.for_each steps ~fn:(emit_agent_step state ~request_id ~agent:!current);
+          if not (String.is_empty text) then (
+            sent := !sent ^ text;
+            write_client ("data: " ^ Json.to_string (delta_chunk_json text) ^ "\n\n")
+          )
+        in
+        let discard_pending () =
+          let blob = !raw in
+          pending := "";
+          pending_steps := [];
+          raw := "";
+          emit_log blob
+        in
         let finish_ok () =
+          commit_pending ();
           let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed !t0) in
           let _ =
             Oasis_signals.update state.signals !current ~fn:(fun s ->
@@ -433,9 +470,11 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
                   ("answer", Json.string (Oasis_steps.clip !sent 60000));
                 ]);
           write_client "data: [DONE]\n\n";
+          closed := true;
           send (self ()) (Conductor_done (Ok ()))
         in
         let finish_fail reason =
+          discard_pending ();
           let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed !t0) in
           let _ =
             Oasis_signals.update state.signals !current ~fn:(fun s ->
@@ -481,8 +520,68 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
                     ("answer", Json.string !sent);
                   ]);
             write_client "data: [DONE]\n\n";
+            closed := true;
             send (self ()) (Conductor_done (Ok ()));
             false
+          )
+        in
+        let finish_cancel = fun ?(kill = false) reason ->
+          if not !closed then (
+            finished := true;
+            (* A process that already exited (pie 130 / 143) must not be signaled
+               again: its pid may have been reused. A caller cancel still kills.
+               The match is parenthesized: a bare match under `if` would swallow
+               every statement after it, and a normal exit would never finish. *)
+            if kill then (
+              match !proc with
+              | Some p -> ignore (Runtime.spawn_blocked (fun () -> Oasis_agent.kill_group p; Ok ()))
+              | None -> ()
+            );
+            release_slot ();
+            (* The partial answer, the cancelled terminal, and the feed status
+               are written before any websocket broadcast or decision-log
+               receive. Those can block or raise; either one used to drop the
+               terminal and leave the task running after the process was dead. *)
+            (try commit_pending () with _ -> ());
+            let err = cancel_error reason in
+            let answer = !sent in
+            let data =
+              Json.obj
+                [
+                  ("chosen", Json.string "none");
+                  ("attempts", Json.int (List.length !attempts + 1));
+                  ("ok", Json.bool false);
+                  ("cancelled", Json.bool true);
+                  ("error", Json.string (cancel_text reason));
+                  ("answer", Json.string (Oasis_steps.clip answer 60000));
+                ]
+            in
+            Oasis_feed.apply state.feed ~type_:"task_done" ~request_id data;
+            let payload =
+              Json.obj [ ("error", Json.obj [ ("message", Json.string (cancel_text reason)); ("type", Json.string "oasis_cancelled") ]) ]
+            in
+            write_client ("data: " ^ Json.to_string payload ^ "\n\n");
+            write_client "data: [DONE]\n\n";
+            closed := true;
+            (try
+               let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed !t0) in
+               attempts :=
+                 { Oasis_router.account = !current; model = !current; status = None; error = Some err; latency_ms; cost_nano = 0 }
+                 :: !attempts;
+               emit_attempt_finished state ~request_id ~account:!current ~status:None ~latency_ms ~error:(Some err);
+               record_decision state { decision with Oasis_router.attempts = List.rev !attempts };
+               track_thread state ~type_:"task_done" ~request_id data;
+               Oasis_signals.save_latency state.signals ~path:(data_path state "latency.json");
+               broadcast_json
+                 state
+                 (Json.obj
+                   [
+                     ("type", Json.string "event");
+                     ("event", Json.string "task_done");
+                     ("request_id", Json.string request_id);
+                     ("data", data);
+                   ])
+             with _ -> ())
           )
         in
         let _ = start_agent () in
@@ -501,66 +600,69 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
             | `Spawned p ->
                 proc := Some p;
                 loop ()
-            | `Cancel reason ->
-                finished := true;
-                (match !proc with
-                 | Some p -> ignore (Runtime.spawn_blocked (fun () -> Oasis_agent.kill_group p; Ok ()))
-                 | None -> ());
-                release_slot ();
-                let err = cancel_error reason in
-                let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed !t0) in
-                attempts :=
-                  { Oasis_router.account = !current; model = !current; status = None; error = Some err; latency_ms; cost_nano = 0 }
-                  :: !attempts;
-                emit_attempt_finished state ~request_id ~account:!current ~status:None ~latency_ms ~error:(Some err);
-                record_decision state { decision with Oasis_router.attempts = List.rev !attempts };
-                emit_task_done ~cancelled:true ~error:(cancel_text reason) ~answer:!sent state ~request_id ~chosen:None
-                  ~attempts:(List.length !attempts) ~ok:false;
-                let payload =
-                  Json.obj [ ("error", Json.obj [ ("message", Json.string (cancel_text reason)); ("type", Json.string "oasis_cancelled") ]) ]
-                in
-                write_client ("data: " ^ Json.to_string payload ^ "\n\n");
-                write_client "data: [DONE]\n\n";
-                ()
-            | `Line line -> (
+            | `Cancel reason -> finish_cancel ~kill:true reason
+            | `Line line ->
                 watch_session ~agent:!current line;
+                raw := !raw ^ line ^ "\n";
                 let text, steps =
                   Oasis_agent.consume_line
                     joiner
                     ~command:(match find_agent config !current with Some a -> a.Oasis_agent.command | None -> "")
                     line
                 in
-                List.for_each steps ~fn:(emit_agent_step state ~request_id ~agent:!current);
-                match text with
-                | "" -> loop ()
-                | text ->
-                    sent := !sent ^ text;
-                    write_client ("data: " ^ Json.to_string (delta_chunk_json text) ^ "\n\n");
-                    loop ()
-              )
+                let rec split live held rest =
+                  match rest with
+                  | [] -> (List.rev live, List.rev held)
+                  | s :: tail ->
+                      if String.equal (Oasis_steps.kind s) "text" then split live (s :: held) tail
+                      else split (s :: live) held tail
+                in
+                let live, held = split [] [] steps in
+                List.for_each live ~fn:(emit_agent_step state ~request_id ~agent:!current);
+                pending_steps := !pending_steps @ held;
+                if not (String.is_empty text) then pending := !pending ^ text;
+                loop ()
             | `Done (code, note) ->
                 finished := true;
                 let note = String.trim note in
-                let silent = String.is_empty (String.trim !sent) in
+                let command =
+                  match find_agent config !current with Some a -> a.Oasis_agent.command | None -> ""
+                in
+                let timeout_s =
+                  match find_agent config !current with Some a -> a.Oasis_agent.timeout_s | None -> 0
+                in
+                (* [pending] is this attempt's answer, not yet committed. Stderr
+                   must not turn that into an empty-answer failure. *)
+                let silent = String.is_empty (String.trim (!sent ^ !pending)) in
                 (* A zero exit with an empty answer and a short stderr note is
                    a failure: WorkBuddy does this when the CLI is not logged in.
                    A long note is the agent's own progress log, not the answer. *)
                 let brief = String.length note <= 240 in
-                let tail =
-                  if String.length note <= 400 then note
-                  else String.sub note ~offset:(String.length note - 400) ~len:400
-                in
-                if code = 0 && not (silent && not (String.is_empty note)) then finish_ok ()
-                else (
-                  if code = 0 && silent && brief then sent := note;
-                  let reason =
-                    if code = 0 && brief then note
-                    else if code = 0 then "agent 结束了这一轮，但没有给出回答"
-                    else
-                      let base = "agent exited with code " ^ Int.to_string code in
-                      if String.is_empty tail then base else base ^ ": " ^ tail
+                if code = 137 && timeout_s > 0 then (
+                  let tail =
+                    if String.length note <= 400 then note
+                    else String.sub note ~offset:(String.length note - 400) ~len:400
                   in
+                  let base = "agent timeout (" ^ Int.to_string timeout_s ^ "s)" in
+                  let reason = if String.is_empty tail then base else base ^ ": " ^ tail in
                   if finish_fail reason then loop ()
+                ) else (
+                  match
+                    Oasis_agent.classify_exit ~command ~code ~note ~detail:joiner.Oasis_steps.detail
+                      ~stop:joiner.Oasis_steps.stop ~subtype:joiner.Oasis_steps.subtype ()
+                  with
+                  | Oasis_agent.Exit_cancelled reason -> finish_cancel reason
+                  | Oasis_agent.Exit_failed msg ->
+                      if finish_fail msg then loop ()
+                  | Oasis_agent.Exit_ok ->
+                      if not (silent && not (String.is_empty note)) then finish_ok ()
+                      else (
+                        if silent && brief then sent := note;
+                        let reason =
+                          if brief then note else "agent 结束了这一轮，但没有给出回答"
+                        in
+                        if finish_fail reason then loop ()
+                      )
                 )
             | `Timeout ->
                 finished := true;
@@ -578,7 +680,8 @@ let handle_chat_agent = fun ?pinned ?prefer ?thread ?workspace ?workdir ?resume 
                 loop ()
           )
         in
-        loop ();
+        (try loop () with _ -> ());
+        if not !closed then finish_cancel "aborted";
         unwatch_task state ~request_id;
         (* client disconnected or stream ended without a finish event:
            release the in-flight slot (not the agent's fault) *)
