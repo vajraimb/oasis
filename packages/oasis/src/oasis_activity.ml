@@ -578,6 +578,35 @@ let capture = fun ~program ~args ->
       Some (String.concat "" (List.rev !chunks))
     )
 
+(** zcode only writes its task index at turn boundaries: while a turn is
+    running, [task_status] is still the previous turn's and [updated_at]
+    is stale, so the index alone reports a live task as completed. The
+    live truth is whether a zcode-cli process is running with that
+    workspace as its cwd. *)
+let zcode_live_cwds = fun () ->
+  match capture ~program:"/usr/bin/pgrep" ~args:[| "-f"; "zcode-cli" |] with
+  | None -> []
+  | Some out ->
+      let pids =
+        String.trim out
+        |> String.split ~by:"\n"
+        |> List.filter ~fn:(fun s -> not (String.is_empty s))
+      in
+      match pids with
+      | [] -> []
+      | _ ->
+          let joined = String.concat "," pids in
+          (match
+             capture ~program:"/usr/sbin/lsof" ~args:[| "-w"; "-a"; "-p"; joined; "-d"; "cwd"; "-Fn" |]
+           with
+           | None -> []
+           | Some body ->
+               String.split ~by:"\n" body
+               |> List.filter_map ~fn:(fun line ->
+                  if String.starts_with ~prefix:"n" line && String.length line > 1 then
+                    Some (String.sub line ~offset:1 ~len:(String.length line - 1))
+                  else None))
+
 let scan_zcode = fun ~home ~now ->
   let db = home ^ "/.zcode/v2/tasks-index.sqlite" in
   if not (is_file db) then []
@@ -591,6 +620,7 @@ let scan_zcode = fun ~home ~now ->
         match Json.from_string (String.trim body) with
         | Error _ -> []
         | Ok (Json.Array items) ->
+            let live_cwds = zcode_live_cwds () in
             cap
               (List.filter_map items ~fn:(fun item ->
                  let project = json_str "workspace_path" item in
@@ -604,6 +634,11 @@ let scan_zcode = fun ~home ~now ->
                        let live =
                          String.equal status "running" || String.equal status "in_progress"
                        in
+                       let process_live =
+                         List.any live_cwds ~fn:(fun cwd ->
+                           String.equal cwd project
+                           || String.starts_with ~prefix:(cwd ^ "/") project)
+                       in
                        Some
                          (row
                             ~agent:"zcode"
@@ -613,7 +648,7 @@ let scan_zcode = fun ~home ~now ->
                             ~turns:0
                             ~tools:0
                             ~excerpt:(json_str "title" item)
-                            ~running:(live || recently ~now t))
+                            ~running:(live || process_live || recently ~now t))
                ))
         | Ok _ -> []
       )
