@@ -26,6 +26,7 @@ module Signals = Oasis_signals
 module Session = Oasis_session
 module Anthropic = Oasis_anthropic
 module Agent = Oasis_agent
+module Proc = Oasis_proc
 module Steps = Oasis_steps
 module Feed = Oasis_feed
 module Classify = Oasis_classify

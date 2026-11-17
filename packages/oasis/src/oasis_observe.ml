@@ -404,28 +404,15 @@ let error_code = fun body ->
 
 let now_s = fun () -> Time.SystemTime.to_unix_timestamp (Time.SystemTime.now ())
 
-let reap_close = fun proc ->
-  let rec go n =
-    match Process.try_wait proc with
-    | Ok (Some (Process.Exited _ | Process.Signaled _)) | Error _ -> ()
-    | Ok None | Ok (Some (Process.Running | Process.Stopped _)) ->
-        if n <= 0 then ()
-        else (
-          sleep (Time.Duration.from_millis 10);
-          go (n - 1)
-        )
-  in
-  go 200;
-  let _ = Process.close proc in
-  ()
-
 let capture = fun ~program ~args ~timeout_s ->
   let stdio = { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Pipe; stderr = Process.Stderr.Null } in
-  match Process.spawn ~program ~args ~stdio () with
+  match Oasis_proc.spawn ~program ~args ~stdio () with
   | Error _ -> None
   | Ok proc ->
+    Oasis_proc.protect ~finally:(fun () -> let _ = Oasis_proc.reap_close proc in ()) (fun () ->
       let deadline = now_s () + timeout_s in
-      let buf = ref "" in
+      let chunks = ref [] in
+      let total = ref 0 in
       let raw = IO.Bytes.create ~size:8192 in
       let rec read_some () =
         match Process.stdout proc with
@@ -434,19 +421,16 @@ let capture = fun ~program ~args ~timeout_s ->
             match Fs.File.read file raw ~offset:0 ~len:8192 with
             | Ok n when n > 0 ->
                 let chunk = IO.Bytes.to_string raw |> fun s -> String.sub s ~offset:0 ~len:n in
-                buf := !buf ^ chunk;
+                chunks := chunk :: !chunks;
+                total := !total + n;
                 true
             | _ -> false
           )
       in
-      let exited () =
-        match Process.try_wait proc with
-        | Ok (Some (Process.Exited _ | Process.Signaled _)) -> true
-        | _ -> false
-      in
+      let exited () = Oasis_proc.exited proc in
       let rec loop () =
-        if String.length !buf > 1500000 || now_s () > deadline then
-          let _ = Process.kill proc ~signal:9 in
+        if !total > 1500000 || now_s () > deadline then
+          let _ = Oasis_proc.kill proc ~signal:9 in
           ()
         else if read_some () then
           loop ()
@@ -454,13 +438,13 @@ let capture = fun ~program ~args ~timeout_s ->
           let _ = read_some () in
           ()
         else (
-          sleep (Time.Duration.from_millis 30);
+          Oasis_proc.pause_ms 30;
           loop ()
         )
       in
       loop ();
-      reap_close proc;
-      Some !buf
+      Some (String.concat "" (List.rev !chunks))
+    )
 
 let argv = fun items -> Array.init ~count:(List.length items) ~fn:(fun i -> List.get_unchecked items ~at:i)
 

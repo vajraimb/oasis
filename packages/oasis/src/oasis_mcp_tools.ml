@@ -104,9 +104,9 @@ let handle_list_activity = fun (state : state) (ctx : Trail.ctx) ->
     | Some n when n > 0 && n <= 60 -> n
     | _ -> 20
   in
-  let query = None in
+  let query = query_param ctx "query" in
   let summaries =
-    Oasis_activity.scan ~home ~limit @ oasis_task_summaries state
+    Oasis_activity.scan_cached ~home ~limit @ oasis_task_summaries state
   in
   let summaries =
     match query with
@@ -410,7 +410,13 @@ let mcp_tool_agent = fun (state : state) (params : Json.t) ->
                   in
                   let t0 = Time.Instant.now () in
                   let on_line = observe nm agent in
-                  let result = blocking_agent_call ~on_line ~agent ~model:model_for ~prompt in
+                  (* A crash must degrade to an Error so the accounting below
+                     (unwatch, in_flight, task status) still runs. *)
+                  let result =
+                    match blocking_agent_call ~on_line ~agent ~model:model_for ~prompt with
+                    | r -> r
+                    | exception _ -> Error "agent_call_crashed"
+                  in
                   let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed t0) in
                   finished nm ~latency_ms result;
                   (
@@ -502,7 +508,14 @@ let mcp_tool_agent = fun (state : state) (params : Json.t) ->
                     watch_task state ~request_id ();
                     let t0 = Time.Instant.now () in
                     let on_line = observe nm agent in
-                    let result = blocking_agent_call ~on_line ~agent ~model:model_for ~prompt in
+                    (* A crash must degrade to an Error so the accounting below
+                       (unwatch, in_flight, emit_task_done, task status) still
+                       runs; otherwise the task would poll as running forever. *)
+                    let result =
+                      match blocking_agent_call ~on_line ~agent ~model:model_for ~prompt with
+                      | r -> r
+                      | exception _ -> Error "agent_call_crashed"
+                    in
                     unwatch_task state ~request_id;
                     let latency_ms = Time.Duration.to_millis (Time.Instant.elapsed t0) in
                     finished nm ~latency_ms result;

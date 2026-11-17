@@ -5,5 +5,11 @@ WORKDIR /app
 
 COPY . /app
 
+# Patch the Riot registry first: unpatched Riot 0.0.43 hangs/crashes under
+# parallel tests (see docs/oasis-spec.md). Same steps as every other entry
+# point (README, AGENTS.md, docs/agent-setup.md).
+RUN riot plan > /dev/null && scripts/patch-riot.sh
+
 RUN riot build --release
-RUN riot test
+# Gateway tests must run serially; parallel riot test can crash the runtime.
+RUN riot test -p oasis -- --concurrency 1

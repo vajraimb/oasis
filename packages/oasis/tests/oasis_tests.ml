@@ -15,6 +15,7 @@ module Signals = Oasis.Signals
 module Session = Oasis.Session
 module Anthropic = Oasis.Anthropic
 module Agent = Oasis.Agent
+module Proc = Oasis.Proc
 module Mcp = Oasis.Mcp
 module Inbox = Oasis.Inbox
 module Discover = Oasis.Discover
@@ -4861,6 +4862,123 @@ let test_agent_finished_turn_does_not_wait = fun _ctx ->
       Test.assert_equal ~expected:true ~actual:(Time.Duration.to_millis (Time.Instant.elapsed t0) < 8000);
       Ok ()
 
+let test_proc_reap_close_collects_child = fun _ctx ->
+  (* /bin/sleep would otherwise stay up and become a zombie if we only
+     Process.close the pipes. *)
+  let stdio =
+    { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Null; stderr = Process.Stderr.Null }
+  in
+  match Process.spawn ~program:"/bin/sleep" ~args:[| "30" |] ~stdio () with
+  | Error _ -> Error "spawn failed"
+  | Ok proc ->
+      let pid = Int.to_string (Process.pid proc) in
+      let _ = Proc.reap_close ~grace_n:0 ~after_kill_n:200 proc in
+      sleep (Time.Duration.from_millis 50);
+      Test.assert_equal ~expected:false ~actual:(pid_alive pid);
+      Ok ()
+
+type Message.t += Proc_reap_done of bool
+
+let null_stdio = { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Null; stderr = Process.Stderr.Null }
+
+(* kill -0 is true for a zombie too, so false here means the child was
+   collected, not just dead. *)
+let wait_gone = fun pid ~ms ->
+  let rec go left =
+    if not (pid_alive pid) then true
+    else if left <= 0 then false
+    else (
+      Proc.pause_ms 50;
+      go (left - 50)
+    )
+  in
+  go ms
+
+let test_proc_concurrent_reap_collects_once = fun _ctx ->
+  match Proc.spawn ~program:"/bin/sleep" ~args:[| "0.3" |] ~stdio:null_stdio () with
+  | Error _ -> Error "spawn failed"
+  | Ok proc ->
+      let pid = Int.to_string (Process.pid proc) in
+      let me = self () in
+      let lanes = 4 in
+      for _ = 1 to lanes do
+        ignore
+          (Runtime.spawn_blocked (fun () ->
+             send me (Proc_reap_done (Proc.reap ~grace_n:300 proc));
+             Ok ()))
+      done;
+      let owner = Proc.reap_close ~grace_n:300 proc in
+      let selector msg = match msg with Proc_reap_done b -> Select b | _ -> Skip in
+      let rec collect n acc =
+        if n = 0 then Ok acc
+        else
+          match receive ~selector ~timeout:(Time.Duration.from_secs 10) () with
+          | exception Receive_timeout -> Error "a reaping lane never returned"
+          | b -> collect (n - 1) (acc && b)
+      in
+      match collect lanes owner with
+      | Error e -> Error e
+      | Ok all ->
+          Test.assert_equal ~expected:true ~actual:all;
+          (* every lane saw the same exit status, cached once *)
+          (match Proc.try_wait proc with
+           | Ok (Some (Process.Exited 0)) -> ()
+           | _ -> Test.assert_equal ~expected:"exit 0" ~actual:"other status");
+          Test.assert_equal ~expected:true ~actual:(wait_gone pid ~ms:2000);
+          (* a collected child is never signalled again *)
+          Test.assert_equal ~expected:true ~actual:(Result.is_ok (Proc.kill proc ~signal:9));
+          Ok ()
+
+let test_proc_reaper_collects_abandoned_child = fun _ctx ->
+  (* The owner never waits (as when its actor stalls before cleanup); the
+     background reaper must still collect the child. *)
+  match Proc.spawn ~program:"/bin/sleep" ~args:[| "0.2" |] ~stdio:null_stdio () with
+  | Error _ -> Error "spawn failed"
+  | Ok proc ->
+      let pid = Int.to_string (Process.pid proc) in
+      Test.assert_equal ~expected:true ~actual:(wait_gone pid ~ms:(Proc.sweep_every_ms * 3 + 1000));
+      (match Proc.try_wait proc with
+       | Ok (Some (Process.Exited 0)) -> ()
+       | _ -> Test.assert_equal ~expected:"exit 0 kept for the owner" ~actual:"other status");
+      let _ = Process.close proc in
+      Ok ()
+
+let test_proc_reap_past_budget_is_handed_off = fun _ctx ->
+  (* With a zero budget [reap_close] returns right after SIGKILL, before
+     the child is collected; the background reaper finishes the job. *)
+  match Proc.spawn ~program:"/bin/sleep" ~args:[| "30" |] ~stdio:null_stdio () with
+  | Error _ -> Error "spawn failed"
+  | Ok proc ->
+      let pid = Int.to_string (Process.pid proc) in
+      let _ = Proc.reap_close ~grace_n:0 ~after_kill_n:0 proc in
+      Test.assert_equal ~expected:true ~actual:(wait_gone pid ~ms:(Proc.sweep_every_ms * 3 + 1000));
+      Ok ()
+
+let test_agent_finished_turn_reaps_process = fun _ctx ->
+  let cwd = Env.current_dir () |> Result.unwrap |> Path.to_string in
+  let script = cwd ^ "/packages/oasis/tests/fixtures/fakebin/grok" in
+  let a = mk_agent ~command:script ~args:[] ~timeout_s:0 "agent_grok_reap" in
+  let child = ref None in
+  let me = self () in
+  let _ =
+    Runtime.spawn_blocked (fun () ->
+      let res = Agent.collect ~on_spawn:(fun p -> child := Some (Process.pid p)) ~agent:a ~model:"" ~prompt:"" () in
+      send me (Agent_collect_done res);
+      Ok ())
+  in
+  let selector msg = match msg with Agent_collect_done r -> Select r | _ -> Skip in
+  match receive ~selector ~timeout:(Time.Duration.from_secs 15) () with
+  | exception Receive_timeout -> Error "collect waited for a grok process that had already finished"
+  | Error e -> Error ("expected the finished answer: " ^ e)
+  | Ok text ->
+      Test.assert_equal ~expected:"hi" ~actual:text;
+      match !child with
+      | None -> Error "collect did not report the spawned pid"
+      | Some pid ->
+          sleep (Time.Duration.from_millis 200);
+          Test.assert_equal ~expected:false ~actual:(pid_alive (Int.to_string pid));
+          Ok ()
+
 let test_agent_silence_limit = fun _ctx ->
   let codex =
     mk_agent
@@ -5136,6 +5254,11 @@ let tests =
     case "steps: clip keeps utf-8 valid" test_steps_clip_utf8;
     case ~size:Test.Large "agent: exit reaps helpers that keep stdout open" test_agent_exit_reaps_lingering_helpers;
     case ~size:Test.Large "agent: a finished grok turn is closed" test_agent_finished_turn_does_not_wait;
+    case "proc: reap_close waitpids a killed child" test_proc_reap_close_collects_child;
+    case "proc: concurrent reaps of one child collect it once" test_proc_concurrent_reap_collects_once;
+    case ~size:Test.Large "proc: the reaper collects a child its owner abandoned" test_proc_reaper_collects_abandoned_child;
+    case ~size:Test.Large "proc: a child past the reap budget is still collected" test_proc_reap_past_budget_is_handed_off;
+    case ~size:Test.Large "agent: a finished grok turn is reaped" test_agent_finished_turn_reaps_process;
     case "agent: silence limit is two minutes, ten for grok" test_agent_silence_limit;
     case ~size:Test.Large "agent: a silent process fails instead of waiting" test_agent_silent_process_fails;
     case ~size:Test.Large "agent: silence after an answer closes the run" test_agent_idle_after_answer_closes;

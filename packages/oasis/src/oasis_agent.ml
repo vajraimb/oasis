@@ -225,9 +225,11 @@ let expand_user = fun path ->
     match home with
     | Some h ->
         let rest = String.sub path ~offset:1 ~len:(String.length path - 1) in
+        (* [&&] does not short-circuit: prove the length before the unchecked read. *)
         let h =
-          if String.length h > 0 && Char.equal (String.get_unchecked h ~at:(String.length h - 1)) '/' then
-            String.sub h ~offset:0 ~len:(String.length h - 1)
+          if String.length h > 0 then
+            let last = String.get_unchecked h ~at:(String.length h - 1) in
+            if Char.equal last '/' then String.sub h ~offset:0 ~len:(String.length h - 1) else h
           else h
         in
         h ^ rest
@@ -423,7 +425,11 @@ let spawn_proc = fun ?(extra = []) ~(agent : agent) ~args () ->
   in
   let workdir =
     if String.is_empty agent.workdir then None
-    else Some (Path.from_string agent.workdir |> Result.unwrap)
+    else
+      (* A malformed configured workdir must not kill the request lane. *)
+      match Path.from_string agent.workdir with
+      | Ok p -> Some p
+      | Error _ -> None
   in
   let env_args = List.map (child_env ~extra agent) ~fn:(fun (k, v) -> k ^ "=" ^ v) in
   (* perl leads a fresh process group so the watchdog can kill the whole
@@ -439,7 +445,7 @@ let spawn_proc = fun ?(extra = []) ~(agent : agent) ~args () ->
   let command = if String.contains agent.command "/" then absolute agent.command else agent.command in
   let argv = ("-i" :: env_args) @ group_leader @ (command :: Array.to_list args) in
   let args = Array.init ~count:(List.length argv) ~fn:(fun i -> List.get_unchecked argv ~at:i) in
-  Process.spawn ~program:"env" ~args ?current_dir:workdir ~stdio ()
+  Oasis_proc.spawn ~program:"env" ~args ?current_dir:workdir ~stdio ()
 
 (* The tree is collected before anything is killed: agent CLIs (grok) run
    tool commands in their own process groups, and once their parent dies
@@ -459,49 +465,42 @@ kill 'KILL', @all;|}
 
 (** SIGKILL the process group led by [proc] (see [spawn_proc]) and every
     descendant, wherever its process group. *)
-(** [Process.close] only closes pipes; it does not waitpid. *)
-let reap_until = fun proc ~n ->
-  let rec go n =
-    match Process.try_wait proc with
-    | Ok (Some (Process.Exited _ | Process.Signaled _)) | Error _ -> true
-    | Ok None | Ok (Some (Process.Running | Process.Stopped _)) ->
-        if n <= 0 then false
-        else (
-          sleep (Time.Duration.from_millis 10);
-          go (n - 1)
-        )
-  in
-  go n
-
-let reap_close = fun proc ->
-  let _ = reap_until proc ~n:200 in
-  let _ = Process.close proc in
-  ()
+let reap_close = Oasis_proc.reap_close
 
 let kill_group = fun (proc : Process.t) ->
+  (* Once the leader is collected its pid may belong to someone else, so
+     neither the tree walk nor the direct kill may run. [Oasis_proc.kill_tree]
+     holds the shared lock across check, tree kill and collection, closing
+     the window where a reaped pid could be reused mid-kill; that is also
+     why the perl helper is spawned raw and waited for inline instead of
+     going through [Oasis_proc] (the mutex is not recursive). [reap] is
+     skipped here on purpose: it never closes the pipes, and the owning
+     lane may still be reading them. *)
   let stdio = { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Null; stderr = Process.Stderr.Null } in
-  (match
-     Process.spawn ~program:"/usr/bin/perl" ~args:[| "-e"; kill_tree_script; Int.to_string (Process.pid proc) |] ~stdio ()
-   with
-   | Error _ -> ()
-   | Ok k ->
-       let _ = reap_until k ~n:200 in
-       let _ = Process.close k in
-       ());
-  let _ = Process.kill proc ~signal:9 in
-  let _ = reap_until proc ~n:200 in
-  ()
+  Oasis_proc.kill_tree proc ~tree_kill:(fun pid ->
+    (match
+       Process.spawn ~program:"/usr/bin/perl" ~args:[| "-e"; kill_tree_script; Int.to_string pid |] ~stdio ()
+     with
+     | Error _ -> ()
+     | Ok k ->
+         let rec wait_killer n =
+           match Process.try_wait k with
+           | Ok (Some (Process.Exited _ | Process.Signaled _)) | Error _ -> ()
+           | Ok _ -> if n > 0 then (Oasis_proc.pause_ms 10; wait_killer (n - 1))
+         in
+         wait_killer 300;
+         let _ = Process.close k in
+         ()))
 
 let watchdog = fun ~(proc : Process.t) ~timeout_s ~to_pid ~leg ->
   (* SIGKILL the subprocess tree after [timeout_s]; runs on its own blocking lane *)
   if timeout_s <= 0 then () else
   ignore @@ Runtime.spawn_blocked (fun () ->
     sleep (Time.Duration.from_secs (max 1 timeout_s));
-    (match Process.try_wait proc with
-     | Ok (Some (Process.Exited _ | Process.Signaled _)) -> ()
-     | _ ->
+    (if Oasis_proc.exited proc then ()
+     else (
          kill_group proc;
-         send to_pid (Agent_timeout leg));
+         send to_pid (Agent_timeout leg)));
     Ok ())
 
 (** Split [pending] into complete lines, feeding each to [on_line]; returns
@@ -598,11 +597,7 @@ let drain_proc = fun ~proc ~on_line ?(idle_s = 0) ?(turn_done = ref false) () ->
     in
     out || err_got
   in
-  let exited () =
-    match Process.try_wait proc with
-    | Ok (Some (Process.Exited _ | Process.Signaled _)) -> true
-    | _ -> false
-  in
+  let exited () = Oasis_proc.exited proc in
   let flush_pending () =
     let _ = read_once () in
     if not (String.is_empty !pending) then (
@@ -646,7 +641,7 @@ let drain_proc = fun ~proc ~on_line ?(idle_s = 0) ?(turn_done = ref false) () ->
   (explain_note !err, !why)
 
 let exit_code = fun ~proc ->
-  match Process.try_wait proc with
+  match Oasis_proc.try_wait proc with
   | Ok (Some (Process.Exited c)) -> c
   | Ok (Some (Process.Signaled s)) -> 128 + s
   | _ -> -1
@@ -714,6 +709,7 @@ let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn 
     match spawn_proc ~extra ~agent ~args () with
     | Error e -> Error ("agent spawn failed: " ^ Process.error_to_string e)
     | Ok proc ->
+        Oasis_proc.protect ~finally:(fun () -> let _ = Oasis_proc.reap_close proc in ()) (fun () ->
         on_spawn proc;
         watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid:(self ()) ~leg:0;
         let buf = ref "" in
@@ -729,7 +725,6 @@ let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn 
         let note, why = drain_proc ~proc ~on_line ~idle_s ~turn_done () in
         let code = exit_code ~proc in
         let detail = jn.Oasis_steps.detail in
-        reap_close proc;
         if retry_bundle ~extra ~code ~note then launch lite_retry
         else
           let with_note = fun msg -> if String.is_empty note then msg else msg ^ ": " ^ note in
@@ -760,6 +755,7 @@ let collect = fun ?(idle_s = -1) ?(on_line = fun (_ : string) -> ()) ?(on_spawn 
                       if not (String.is_empty (String.trim !buf)) then Ok !buf
                       else if not (String.is_empty note) then Error note
                       else Ok !buf
+        )
   in
   launch []
 
@@ -786,6 +782,7 @@ let stream = fun ~(agent : agent) ~model ~prompt ~to_pid ~leg () ->
         send to_pid (Agent_done (leg, -1, ""));
         Ok ()
     | Ok proc ->
+        Oasis_proc.protect ~finally:(fun () -> let _ = Oasis_proc.reap_close proc in ()) (fun () ->
         send to_pid (Agent_spawned (leg, proc));
         watchdog ~proc ~timeout_s:agent.timeout_s ~to_pid ~leg;
         let turn_done = ref false in
@@ -807,10 +804,10 @@ let stream = fun ~(agent : agent) ~model ~prompt ~to_pid ~leg () ->
           | Idle when not !saw_text -> "agent idle (" ^ Int.to_string idle_s ^ "s) with no answer"
           | _ -> note
         in
-        reap_close proc;
         if retry_bundle ~extra ~code ~note then launch lite_retry
         else (
           send to_pid (Agent_done (leg, code, note));
           Ok ())
+        )
   in
   launch []

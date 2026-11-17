@@ -183,10 +183,8 @@ let decode_slashes = fun s ->
   String.split ~by:"%2f" s |> String.concat "/"
 
 let by_recent = fun items ->
-  List.sort items ~compare:(fun a b ->
-    if a.last_ts > b.last_ts then LT
-    else if a.last_ts < b.last_ts then GT
-    else EQ)
+  (* Float.compare, not the polymorphic [<]/[>]: this runs on every scan. *)
+  List.sort items ~compare:(fun a b -> Float.compare b.last_ts a.last_ts)
 
 let cap = fun items -> by_recent items |> List.take ~len:per_agent
 
@@ -535,30 +533,17 @@ let scan_dsh = fun ~home ~now ->
         ));
   cap !found
 
-let reap_close = fun proc ->
-  let rec go n =
-    match Process.try_wait proc with
-    | Ok (Some (Process.Exited _ | Process.Signaled _)) | Error _ -> ()
-    | Ok None | Ok (Some (Process.Running | Process.Stopped _)) ->
-        if n <= 0 then ()
-        else (
-          sleep (Time.Duration.from_millis 10);
-          go (n - 1)
-        )
-  in
-  go 200;
-  let _ = Process.close proc in
-  ()
-
 let capture = fun ~program ~args ->
   let stdio =
     { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Pipe; stderr = Process.Stderr.Null }
   in
-  match Process.spawn ~program ~args ~stdio () with
+  match Oasis_proc.spawn ~program ~args ~stdio () with
   | Error _ -> None
   | Ok proc ->
+    Oasis_proc.protect ~finally:(fun () -> let _ = Oasis_proc.reap_close proc in ()) (fun () ->
       let deadline = now_s () +. 3.0 in
-      let buf = ref "" in
+      let chunks = ref [] in
+      let total = ref 0 in
       let raw = IO.Bytes.create ~size:8192 in
       let rec read_some () =
         match Process.stdout proc with
@@ -569,32 +554,29 @@ let capture = fun ~program ~args ->
                 let chunk = IO.Bytes.to_string raw in
                 let len = String.length chunk in
                 let piece = if n < len then String.sub chunk ~offset:0 ~len:n else chunk in
-                buf := !buf ^ piece;
+                chunks := piece :: !chunks;
+                total := !total + n;
                 true
             | _ -> false
           )
       in
-      let exited () =
-        match Process.try_wait proc with
-        | Ok (Some (Process.Exited _ | Process.Signaled _)) -> true
-        | _ -> false
-      in
+      let exited () = Oasis_proc.exited proc in
       let rec loop () =
-        if String.length !buf > 200000 || now_s () > deadline then
-          let _ = Process.kill proc ~signal:9 in
+        if !total > 200000 || now_s () > deadline then
+          let _ = Oasis_proc.kill proc ~signal:9 in
           ()
         else if read_some () then loop ()
         else if exited () then
           let _ = read_some () in
           ()
         else (
-          sleep (Time.Duration.from_millis 20);
+          Oasis_proc.pause_ms 20;
           loop ()
         )
       in
       loop ();
-      reap_close proc;
-      Some !buf
+      Some (String.concat "" (List.rev !chunks))
+    )
 
 let scan_zcode = fun ~home ~now ->
   let db = home ^ "/.zcode/v2/tasks-index.sqlite" in
@@ -921,11 +903,21 @@ let capture_tail = fun ~program ~args ->
   let stdio =
     { Process.stdin = Process.Stdin.Null; stdout = Process.Stdout.Pipe; stderr = Process.Stderr.Null }
   in
-  match Process.spawn ~program ~args ~stdio () with
+  match Oasis_proc.spawn ~program ~args ~stdio () with
   | Error _ -> None
   | Ok proc ->
+    Oasis_proc.protect ~finally:(fun () -> let _ = Oasis_proc.reap_close proc in ()) (fun () ->
       let deadline = now_s () +. 8.0 in
-      let buf = ref "" in
+      let chunks = ref [] in
+      let total = ref 0 in
+      let keep_tail = fun n ->
+        let all = String.concat "" (List.rev !chunks) in
+        let len = String.length all in
+        let tail = if len > n then String.sub all ~offset:(len - n) ~len:n else all in
+        chunks := [ tail ];
+        total := String.length tail;
+        tail
+      in
       let raw = IO.Bytes.create ~size:8192 in
       let rec read_some () =
         match Process.stdout proc with
@@ -936,34 +928,30 @@ let capture_tail = fun ~program ~args ->
                 let chunk = IO.Bytes.to_string raw in
                 let len = String.length chunk in
                 let piece = if n < len then String.sub chunk ~offset:0 ~len:n else chunk in
-                buf := !buf ^ piece;
-                let kept = String.length !buf in
-                if kept > 180000 then buf := String.sub !buf ~offset:(kept - 160000) ~len:160000;
+                chunks := piece :: !chunks;
+                total := !total + n;
+                if !total > 360000 then ignore (keep_tail 160000);
                 true
             | _ -> false
           )
       in
-      let exited () =
-        match Process.try_wait proc with
-        | Ok (Some (Process.Exited _ | Process.Signaled _)) -> true
-        | _ -> false
-      in
+      let exited () = Oasis_proc.exited proc in
       let rec loop () =
         if now_s () > deadline then
-          let _ = Process.kill proc ~signal:9 in
+          let _ = Oasis_proc.kill proc ~signal:9 in
           ()
         else if read_some () then loop ()
         else if exited () then
           let _ = read_some () in
           ()
         else (
-          sleep (Time.Duration.from_millis 20);
+          Oasis_proc.pause_ms 20;
           loop ()
         )
       in
       loop ();
-      reap_close proc;
-      Some !buf
+      Some (if !total > 180000 then keep_tail 160000 else String.concat "" (List.rev !chunks))
+    )
 
 let zstd_text = fun path ->
   let rec go = fun rest ->
@@ -1073,6 +1061,32 @@ let scan = fun ~home ~limit ->
       scan_grok ~home ~now;
     ]
 
+(** [scan] for the dashboard, which polls every few seconds per open tab
+    (more while tasks stream events). A full scan reads the session stores
+    of every local agent and starts sqlite3/zstd, about 1.5 s of CPU, so the
+    result is reused for [scan_cache_s]. Sessions count as running for
+    [recent_s] (180 s), so the list is at most a few seconds behind. *)
+let scan_cache_s = 8.0
+
+let scan_cache : (string * int * float * session_summary list) list Sync.Atomic.t = Sync.Atomic.make []
+
+let scan_cached = fun ~home ~limit ->
+  let now = now_s () in
+  let fresh =
+    List.find (Sync.Atomic.get scan_cache) ~fn:(fun (h, l, at, _) ->
+      String.equal h home && Int.equal l limit && now -. at >= 0.0 && now -. at < scan_cache_s)
+  in
+  match fresh with
+  | Some (_, _, _, rows) -> rows
+  | None ->
+      let rows = scan ~home ~limit in
+      let others =
+        List.filter (Sync.Atomic.get scan_cache) ~fn:(fun (h, l, at, _) ->
+          (not (String.equal h home && Int.equal l limit)) && now -. at < scan_cache_s)
+      in
+      Sync.Atomic.set scan_cache ((home, limit, now_s (), rows) :: others);
+      rows
+
 let dsh_bits = fun body ->
   let bits = ref [] in
   List.for_each (String.split ~by:"\n" body) ~fn:(fun raw ->
@@ -1113,7 +1127,9 @@ let observe = fun ~home ~agent ~session_id ->
   if not (safe_id session_id) then None
   else
     let known =
-      List.find (scan ~home ~limit:60) ~fn:(fun s ->
+      (* cached: a full scan costs ~1.5s CPU plus sqlite3/zstd spawns, and
+         this runs on a dashboard-polled endpoint *)
+      List.find (scan_cached ~home ~limit:60) ~fn:(fun s ->
         String.equal s.agent agent && String.equal s.session_id session_id)
     in
     let project = match known with Some s -> s.project | None -> "" in
