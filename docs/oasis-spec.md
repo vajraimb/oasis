@@ -369,7 +369,7 @@ spec 只约束**语义**：
 
 - **内置目录**：13 家服务商，每家给出端点列表（如 Kimi：Kimi Coding → moonshot.cn → moonshot.ai；
   GLM：z.ai Anthropic 端点 → z.ai paas → bigmodel）、协议、标准 key 变量名、已知模型及其 KB、
-  `prefer` 顺序和申请 key 的链接；6 个 agent 的无人值守参数（Claude Code 禁用 `AskUserQuestion`）。
+  `prefer` 顺序和申请 key 的链接；12 个 agent 的无人值守参数（Claude Code 禁用 `AskUserQuestion`）。
   目录外的模型按名字推断 KB（按名称分词判断 mini/flash/lite 等，避免 "gemini" 误判为 mini；
   `gemini-3.1-pro-preview` 这类变体沿用最长前缀的目录项）
 - **探测**：key 变量取标准名，再加上任何同时含服务商关键字和 key/apikey/token/secret 片段的变量
@@ -525,7 +525,7 @@ WS 事件流新增 `handoff` 事件，payload 同上一条。
    跨请求共享状态统一走 `ConcurrentHashMap`（§1.4）
 
    **[0.3 新增]** 上面的"spawn 挂起 / start_child 挂起 / 测试中 SIGSEGV"已定位为 Riot 0.0.43
-   kernel/std 的四个缺陷，以补丁形式放在 `patches/riot/`，由 `scripts/patch-riot.sh` 幂等打到
+   kernel/std 的五个缺陷（kernel 1 个、std 4 个），以补丁形式放在 `patches/riot/`，由 `scripts/patch-riot.sh` 幂等打到
    `~/.riot/registry/pkgs.ml/src/<pkg>/<ver>`（Riot 没有依赖覆盖机制；`riot plan` 拉源码后、
    `riot build` 前执行，CI 同此流程）：
 
@@ -537,7 +537,7 @@ WS 事件流新增 `handoff` 事件，payload 同上一条。
    | 同上 ③ | `step_process` 中 `has_messages && try_mark_runnable…`：`Kernel.(&&)` 是普通函数、不短路，无消息时也把 `Waiting_message` 翻成 `Runnable` 却不入队 | 进程停在 `Runnable` 但不在任何队列 |
    | 同上 ④ | 定时器轮 `tick` 把 `current_time` 直接设为 `now`，丢弃不足一格的余量；`calculate_slot` 可能把定时器放进已处理的当前格 | reactor 循环快于一格时轮子冻结；短定时器晚一整圈触发 |
 
-   修复后 `riot test`（默认并行）连续 3 次 86/86，`oasis_tests --concurrency 4/8/16` 共 60 次 0 挂起
+   修复后 `riot test`（默认并行）连续 3 次 86/86（当时的全量用例数；此后用例增至 155，串行保持全过），`oasis_tests --concurrency 4/8/16` 共 60 次 0 挂起
    （修复前 4 并发约 15–30% 挂起）。补丁应同步上游；升级 Riot 版本时须重新核对
 
 ### 4.3 数据类

@@ -111,8 +111,10 @@ let build_trail = fun (state : state) ->
   Trail.pipeline
     [
       Trail.use_server_header "Oasis/0.2 (Riot; Nomad; Trail)";
-      use_cors_with_auth;
+      (* auth before CORS: 401/403 bodies must not carry the permissive
+         Access-Control-Allow-Origin header *)
       use_auth state;
+      use_cors_with_auth;
       Trail.router
         [
           Trail.get "/" (fun ctx -> Trail.html ctx Oasis_dashboard.index_html);

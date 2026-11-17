@@ -182,7 +182,29 @@ let agent_alerts = fun (state : state) ~(discovered : Oasis_discover.agent_statu
         ]
       else []
     in
-    presence @ failing
+    let unconstrained =
+      (* No workdir of its own and no allow-list: any absolute, existing
+         directory is accepted as an MCP workdir argument (spec §5.2
+         deviation). Surfaced here so the operator can confine it. *)
+      if
+        List.is_empty presence
+        && String.is_empty a.Oasis_agent.workdir
+        && List.is_empty a.Oasis_agent.allowed_workdirs
+      then
+        [
+          {
+            severity = "warn";
+            target = name;
+            title = "workdir 未限定";
+            detail =
+              "这个 agent 没有配置 workdir 或 allowed_workdirs，MCP 调用方可以把它指到本机任意目录运行。";
+            fix =
+              "在 oasis.toml 的这个 agent 上加 workdir = \"~/projects\"（或列出 allowed_workdirs）";
+          };
+        ]
+      else []
+    in
+    presence @ failing @ unconstrained
 
 let collect = fun (state : state) ~(home : string) ->
   let config = Sync.Atomic.get state.config in

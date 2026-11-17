@@ -755,14 +755,25 @@ let observation_json = fun (o : observation) ->
     ]
 
 let safe_id = fun s ->
-  (not (String.is_empty s))
-  && not (String.contains s "/")
-  && not (String.contains s "\\")
-  && not (String.contains s "'")
-  && not (String.contains s "\"")
-  && not (String.contains s " ")
-  && not (String.contains s ";")
-  && not (String.contains s "..")
+  (* allowlist, not a blacklist: [session_id] is interpolated into sqlite3
+     SQL, so only [A-Za-z0-9_.-] may pass, and no leading dash. Bounds are
+     proven before every unchecked read ([&&] does not short-circuit). *)
+  let len = String.length s in
+  if len = 0 || len > 128 then false
+  else if Char.code (String.get_unchecked s ~at:0) = Char.code '-' then false
+  else
+    let ok_code = fun code ->
+      (code >= Char.code 'a' && code <= Char.code 'z')
+      || (code >= Char.code 'A' && code <= Char.code 'Z')
+      || (code >= Char.code '0' && code <= Char.code '9')
+      || code = Char.code '_' || code = Char.code '.' || code = Char.code '-'
+    in
+    let rec chars i =
+      if i >= len then true
+      else if ok_code (Char.code (String.get_unchecked s ~at:i)) then chars (i + 1)
+      else false
+    in
+    chars 0
 
 let clip_text = fun text ->
   let text = String.trim text in

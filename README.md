@@ -47,7 +47,7 @@ Every account shows this month's spend next to its monthly budget. Every routing
 
 > A new provider or a new agent usually means another tool.
 
-An account is an OpenAI-compatible endpoint or an Anthropic endpoint. An agent is a local command. The built-in 13 providers and 6 agents are ready-made entries. Paste a key on the setup page, or add a block to the config, and you have one more. Other programs can also connect over MCP to ask a model or hand off a task.
+An account is an OpenAI-compatible endpoint or an Anthropic endpoint. An agent is a local command. The built-in 13 providers and 12 agents are ready-made entries. Paste a key on the setup page, or add a block to the config, and you have one more. Other programs can also connect over MCP to ask a model or hand off a task.
 
 ## Ways to use it
 
